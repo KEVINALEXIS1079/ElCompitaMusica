@@ -2039,13 +2039,13 @@ class ElCompitaBot(commands.Bot):
             f"📦 discord.py={discord.__version__} | yt-dlp={yt_dlp.version.__version__} | "
             f"opus={discord.opus.is_loaded()} | davey={davey_ver}"
         )
-        self.loop.create_task(start_healthcheck_server())
         await self.add_cog(MusicCog(self))
-        try:
-            synced = await self.tree.sync()
-            logger.info(f"Se sincronizaron {len(synced)} comandos híbridos/slash.")
-        except Exception as exc:
-            logger.warning(f"No se pudieron sincronizar los slash commands globalmente: {exc}")
+        if os.getenv("SYNC_COMMANDS", "0") == "1":
+            try:
+                synced = await self.tree.sync()
+                logger.info(f"Se sincronizaron {len(synced)} comandos híbridos/slash.")
+            except Exception as exc:
+                logger.warning(f"No se pudieron sincronizar los slash commands globalmente: {exc}")
 
     async def on_ready(self) -> None:
         if self.user:
@@ -2133,15 +2133,48 @@ async def start_healthcheck_server() -> None:
             pass
 
 
-def main() -> None:
+async def async_main() -> None:
     if not DISCORD_TOKEN or DISCORD_TOKEN == "PEGA_TU_TOKEN_AQUI":
         raise RuntimeError(
             "No se encontró un DISCORD_TOKEN válido en el archivo .env. "
             "Por favor, configura DISCORD_TOKEN en .env antes de iniciar el bot."
         )
+
     start_bgutil_pot_server()
-    bot = ElCompitaBot()
-    bot.run(DISCORD_TOKEN, log_handler=None)
+    asyncio.create_task(start_healthcheck_server())
+
+    backoff = 45
+    while True:
+        bot = ElCompitaBot()
+        try:
+            async with bot:
+                await bot.start(DISCORD_TOKEN, reconnect=True)
+        except discord.errors.HTTPException as exc:
+            if exc.status == 429:
+                retry_after = 0.0
+                if exc.response and exc.response.headers:
+                    try:
+                        retry_after = float(exc.response.headers.get("Retry-After", "0"))
+                    except Exception:
+                        retry_after = 0.0
+                wait_s = max(int(retry_after) + 5, backoff)
+                logger.warning(
+                    f"⏳ IP compartida de Render limitada temporalmente por Discord (HTTP 429). "
+                    f"Contenedor activo en puerto web; reintentando login en {wait_s}s..."
+                )
+                await asyncio.sleep(wait_s)
+                backoff = min(backoff + 45, 300)
+                continue
+            logger.error(f"HTTPException en Discord ({exc.status}): {exc}. Reintentando en {backoff}s...")
+            await asyncio.sleep(backoff)
+        except Exception as exc:
+            logger.error(f"Error en sesión de Discord ({exc}). Reintentando en {backoff}s...")
+            await asyncio.sleep(backoff)
+            backoff = min(backoff + 30, 180)
+
+
+def main() -> None:
+    asyncio.run(async_main())
 
 
 if __name__ == "__main__":
