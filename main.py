@@ -1,18 +1,18 @@
 import asyncio
 from collections import deque
 from dataclasses import dataclass
+import json
 import logging
 import os
+import shutil
 from typing import Any, Deque, Dict, List, Optional
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 import urllib.request
 
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp
-
-import shutil
 
 # Configuración de logging
 logging.basicConfig(
@@ -27,66 +27,86 @@ DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
 COOKIES_FILE = "/tmp/cookies.txt" if os.name != "nt" else "cookies.txt"
 
+# Silenciar logs de bug reports de yt-dlp
+yt_dlp.utils.bug_reports_message = lambda *args, **kwargs: ""
+
 
 def prepare_cookies_file() -> Optional[str]:
     """
-    Prepara un archivo cookies.txt escribible en /tmp/cookies.txt a partir de:
-    1. Secret Files de Render (/etc/secrets/cookies.txt)
-    2. Archivo local ./cookies.txt
+    Detecta y prepara un archivo cookies.txt escribible en /tmp/cookies.txt buscando en:
+    1. Cualquier archivo dentro de /etc/secrets/ (Secret Files de Render)
+    2. Cualquier archivo *cookie*.txt en el directorio actual
     3. Variable de entorno YOUTUBE_COOKIES
     """
-    if os.path.isfile("/etc/secrets/cookies.txt") and os.path.getsize("/etc/secrets/cookies.txt") > 0:
+    # 1. Revisar /etc/secrets (Render Secret Files)
+    secrets_dir = "/etc/secrets"
+    if os.path.isdir(secrets_dir):
         try:
-            shutil.copyfile("/etc/secrets/cookies.txt", COOKIES_FILE)
-            logger.info("✅ Cookies de YouTube cargadas desde /etc/secrets/cookies.txt")
-            return COOKIES_FILE
+            secret_files = os.listdir(secrets_dir)
+            logger.info(f"📂 Archivos detectados en /etc/secrets: {secret_files}")
+            for fname in secret_files:
+                fpath = os.path.join(secrets_dir, fname)
+                if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
+                    if "cookie" in fname.lower() or "youtube" in fname.lower():
+                        shutil.copyfile(fpath, COOKIES_FILE)
+                        logger.info(f"✅ Cookies de YouTube cargadas desde {fpath} ({os.path.getsize(fpath)} bytes)")
+                        return COOKIES_FILE
         except Exception as exc:
-            logger.warning(f"No se pudo copiar /etc/secrets/cookies.txt: {exc}")
+            logger.warning(f"Error inspeccionando /etc/secrets: {exc}")
 
-    if os.path.isfile("cookies.txt") and os.path.getsize("cookies.txt") > 0:
-        if COOKIES_FILE != "cookies.txt":
-            try:
-                shutil.copyfile("cookies.txt", COOKIES_FILE)
-                logger.info("✅ Cookies de YouTube cargadas desde ./cookies.txt")
-                return COOKIES_FILE
-            except Exception:
-                return "cookies.txt"
-        logger.info("✅ Cookies de YouTube cargadas desde ./cookies.txt")
-        return "cookies.txt"
+    # 2. Revisar directorio actual por cookies.txt o *cookies*.txt
+    try:
+        for fname in os.listdir("."):
+            if os.path.isfile(fname) and "cookie" in fname.lower() and fname.endswith(".txt"):
+                if os.path.getsize(fname) > 0:
+                    if COOKIES_FILE != fname:
+                        shutil.copyfile(fname, COOKIES_FILE)
+                        logger.info(f"✅ Cookies de YouTube cargadas desde ./{fname}")
+                        return COOKIES_FILE
+                    logger.info(f"✅ Cookies de YouTube cargadas desde ./{fname}")
+                    return fname
+    except Exception:
+        pass
 
+    # 3. Revisar variable de entorno YOUTUBE_COOKIES
     if YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip():
         try:
             with open(COOKIES_FILE, "w", encoding="utf-8") as f:
                 f.write(YOUTUBE_COOKIES.strip() + "\n")
-            logger.info("✅ Cookies de YouTube cargadas desde variable YOUTUBE_COOKIES")
+            logger.info("✅ Cookies de YouTube cargadas desde la variable YOUTUBE_COOKIES")
             return COOKIES_FILE
         except Exception as exc:
             logger.warning(f"No se pudo escribir YOUTUBE_COOKIES: {exc}")
 
+    logger.info("ℹ️ No se detectó archivo cookies.txt; se usará modo híbrido (YouTube + respaldo automático SoundCloud).")
     return None
 
 
 ACTIVE_COOKIES_FILE = prepare_cookies_file()
 
-# Silenciar logs de bug reports de yt-dlp
-yt_dlp.utils.bug_reports_message = lambda *args, **kwargs: ""
 
-
-def build_ytdl_options(*, allow_playlist: bool = False, flat_playlist: bool = False, playlist_end: int = 100) -> Dict[str, Any]:
-    """Construye las opciones de yt-dlp e inyecta cookies.txt si el usuario lo configuró."""
+def build_ytdl_options(
+    *,
+    allow_playlist: bool = False,
+    flat_playlist: bool = False,
+    playlist_end: int = 100,
+    default_search: str = "ytsearch",
+) -> Dict[str, Any]:
+    """Construye las opciones de yt-dlp e inyecta cookies.txt si está disponible."""
     opts: Dict[str, Any] = {
         "format": "bestaudio/best",
-        "default_search": "ytsearch",
+        "default_search": default_search,
         "noplaylist": not allow_playlist,
         "quiet": True,
         "no_warnings": True,
-        "ignoreerrors": True,
+        "ignoreerrors": False,
         "extract_flat": "in_playlist" if flat_playlist else False,
         "playlistend": playlist_end,
         "source_address": "0.0.0.0",
     }
-    if ACTIVE_COOKIES_FILE and os.path.isfile(ACTIVE_COOKIES_FILE):
-        opts["cookiefile"] = ACTIVE_COOKIES_FILE
+    cookie_path = ACTIVE_COOKIES_FILE or (COOKIES_FILE if os.path.isfile(COOKIES_FILE) else None)
+    if cookie_path and os.path.isfile(cookie_path) and os.path.getsize(cookie_path) > 0:
+        opts["cookiefile"] = cookie_path
     return opts
 
 
@@ -108,6 +128,22 @@ def is_playlist_query(query: str) -> bool:
     if "/playlist" in parsed.path or "/sets/" in parsed.path or "/album/" in parsed.path:
         return True
     return False
+
+
+def fetch_youtube_oembed_title(url: str) -> Optional[str]:
+    """Obtiene el título de un video de YouTube vía oEmbed público (no requiere cookies ni sufre bloqueos de IP)."""
+    try:
+        oembed_url = f"https://www.youtube.com/oembed?url={quote(url, safe='')}&format=json"
+        req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            title = data.get("title")
+            author = data.get("author_name", "")
+            if title and author and author.lower() not in title.lower():
+                return f"{title} {author}"
+            return title
+    except Exception:
+        return None
 
 
 @dataclass
@@ -152,8 +188,10 @@ class GuildMusicState:
         self.last_track = track
         if track.video_id and track.video_id not in self.history_ids:
             self.history_ids.append(track.video_id)
-        elif track.webpage_url and track.webpage_url not in self.history_ids:
+        if track.webpage_url and track.webpage_url not in self.history_ids:
             self.history_ids.append(track.webpage_url)
+        if track.title:
+            self.history_ids.append(track.title.lower())
 
     def clear(self) -> None:
         self.queue.clear()
@@ -167,10 +205,48 @@ class GuildMusicState:
             self.inactivity_task = None
 
 
+def _extract_from_soundcloud(search_text: str, requester: discord.abc.User) -> Track:
+    """Respaldo automático con SoundCloud cuando la IP de la nube es bloqueada por YouTube sin cookies."""
+    clean_query = search_text.strip()
+    for noise in ("(Official Video)", "(Video Oficial)", "[Official Video]", "(Official Audio)", "(Lyrics)", "(Letra)"):
+        clean_query = clean_query.replace(noise, "").replace(noise.lower(), "")
+    sc_opts = build_ytdl_options(
+        allow_playlist=False,
+        flat_playlist=False,
+        default_search="scsearch",
+    )
+    target = clean_query if clean_query.startswith(("http://", "https://", "scsearch")) else f"scsearch1:{clean_query}"
+    with yt_dlp.YoutubeDL(sc_opts) as ytdl:
+        info = ytdl.extract_info(target, download=False)
+
+    if not info:
+        raise ValueError(f"No se encontró audio para '{search_text}'.")
+
+    if "entries" in info:
+        entries = [e for e in info.get("entries", []) if e]
+        if not entries:
+            raise ValueError(f"No se encontraron resultados para '{search_text}'.")
+        info = entries[0]
+
+    stream_url = info.get("url")
+    if not stream_url:
+        raise ValueError(f"No se pudo obtener stream de audio para '{search_text}'.")
+
+    return Track(
+        title=info.get("title", search_text),
+        webpage_url=info.get("webpage_url") or search_text,
+        stream_url=stream_url,
+        video_id=info.get("id"),
+        duration=info.get("duration"),
+        thumbnail=info.get("thumbnail"),
+        requester=requester,
+    )
+
+
 def extract_tracks(query: str, requester: discord.abc.User) -> List[Track]:
     """
     Extrae una canción individual o una playlist completa con yt-dlp.
-    Para playlists usa extract_flat='in_playlist' para agregar decenas de pistas al instante.
+    Si YouTube bloquea la IP del servidor en la nube por falta de cookies, usa respaldo automático en SoundCloud.
     """
     playlist_mode = is_playlist_query(query)
     opts = build_ytdl_options(
@@ -178,21 +254,46 @@ def extract_tracks(query: str, requester: discord.abc.User) -> List[Track]:
         flat_playlist=playlist_mode,
         playlist_end=100,
     )
+    if playlist_mode:
+        opts["ignoreerrors"] = True
 
-    with yt_dlp.YoutubeDL(opts) as ytdl:
-        info = ytdl.extract_info(query, download=False)
+    info = None
+    yt_error = None
+    try:
+        with yt_dlp.YoutubeDL(opts) as ytdl:
+            info = ytdl.extract_info(query, download=False)
+    except Exception as exc:
+        yt_error = exc
+        logger.warning(f"Aviso en extracción directa de YouTube ({query}): {exc}")
+
+    # Si falló YouTube en pista individual (ej. bloqueo anti-bot en IP de Render), activar respaldo automático
+    if not info and not playlist_mode:
+        fallback_query = query
+        if query.startswith(("http://", "https://")) and ("youtube.com" in query or "youtu.be" in query):
+            oembed_title = fetch_youtube_oembed_title(query)
+            if oembed_title:
+                fallback_query = oembed_title
+            else:
+                raise ValueError(
+                    "YouTube bloqueó la conexión desde la nube. Agrega `cookies.txt` en Render Secret Files o busca la canción por su nombre."
+                )
+        logger.info(f"🔄 Usando respaldo automático de streaming para: '{fallback_query}'")
+        track = _extract_from_soundcloud(fallback_query, requester)
+        return [track]
 
     if not info:
-        raise ValueError("No se pudo obtener información del audio solicitado.")
+        raise ValueError(f"No se pudo obtener información del audio solicitado ({yt_error}).")
 
     tracks: List[Track] = []
 
     if "entries" in info:
         entries = [e for e in info.get("entries", []) if e]
         if not entries:
+            if not playlist_mode:
+                track = _extract_from_soundcloud(query, requester)
+                return [track]
             raise ValueError(f"No se encontraron resultados para: `{query}`")
 
-        # Si fue una búsqueda por texto (ej. ytsearch), tomamos el primer resultado completo
         if not playlist_mode:
             entry = entries[0]
             webpage = entry.get("webpage_url") or entry.get("url") or query
@@ -208,7 +309,6 @@ def extract_tracks(query: str, requester: discord.abc.User) -> List[Track]:
                 )
             )
         else:
-            # Es una playlist: creamos los Track ligeros y su stream se resuelve al tocarles turno
             for entry in entries:
                 vid_id = entry.get("id")
                 raw_url = entry.get("webpage_url") or entry.get("url")
@@ -255,35 +355,45 @@ def extract_tracks(query: str, requester: discord.abc.User) -> List[Track]:
 
 
 def resolve_track_stream(track: Track) -> Track:
-    """Resuelve el stream de audio real de un Track si provino de una playlist o de Autoplay."""
+    """Resuelve el stream de audio real de un Track; si YouTube bloquea la IP, resuelve por título en SoundCloud."""
     if track.stream_url:
         return track
 
     opts = build_ytdl_options(allow_playlist=False, flat_playlist=False)
     target = track.webpage_url or (f"https://www.youtube.com/watch?v={track.video_id}" if track.video_id else track.title)
 
-    with yt_dlp.YoutubeDL(opts) as ytdl:
-        info = ytdl.extract_info(target, download=False)
+    info = None
+    try:
+        with yt_dlp.YoutubeDL(opts) as ytdl:
+            info = ytdl.extract_info(target, download=False)
+    except Exception as exc:
+        logger.warning(f"Resolución directa en YouTube falló para '{track.title}', usando respaldo: {exc}")
 
-    if not info:
-        raise ValueError(f"No se pudo resolver el stream para {track.title}")
-
-    if "entries" in info:
+    if info and "entries" in info:
         entries = [e for e in info.get("entries", []) if e]
-        if not entries:
-            raise ValueError(f"Sin resultados al resolver {track.title}")
-        info = entries[0]
+        info = entries[0] if entries else None
 
-    stream_url = info.get("url")
-    if not stream_url:
-        raise ValueError(f"No se encontró URL de audio para {track.title}")
+    if info and info.get("url"):
+        track.stream_url = info.get("url")
+        track.title = info.get("title") or track.title
+        track.webpage_url = info.get("webpage_url") or track.webpage_url
+        track.video_id = info.get("id") or track.video_id
+        track.duration = info.get("duration") or track.duration
+        track.thumbnail = info.get("thumbnail") or track.thumbnail
+        return track
 
-    track.stream_url = stream_url
-    track.title = info.get("title") or track.title
-    track.webpage_url = info.get("webpage_url") or track.webpage_url
-    track.video_id = info.get("id") or track.video_id
-    track.duration = info.get("duration") or track.duration
-    track.thumbnail = info.get("thumbnail") or track.thumbnail
+    # Respaldo con SoundCloud usando el título de la pista
+    search_title = track.title
+    if (not search_title or search_title == "Canción de la playlist") and track.webpage_url:
+        oembed_title = fetch_youtube_oembed_title(track.webpage_url)
+        if oembed_title:
+            search_title = oembed_title
+
+    sc_track = _extract_from_soundcloud(search_title, track.requester)
+    track.stream_url = sc_track.stream_url
+    track.title = track.title if track.title != "Canción de la playlist" else sc_track.title
+    track.duration = track.duration or sc_track.duration
+    track.thumbnail = track.thumbnail or sc_track.thumbnail
     return track
 
 
@@ -294,18 +404,21 @@ def fetch_recommended_track(
 ) -> Optional[Track]:
     """
     Obtiene una canción recomendada automáticamente usando el Mix/Radio oficial de YouTube (RD<video_id>)
-    o búsqueda relacionada si no hay ID de YouTube, evitando repetir canciones recientes.
+    o búsqueda relacionada en YouTube/SoundCloud, evitando repetir canciones recientes.
     """
     history_set = set(history_ids)
     if last_track.video_id:
         history_set.add(last_track.video_id)
     if last_track.webpage_url:
         history_set.add(last_track.webpage_url)
+    if last_track.title:
+        history_set.add(last_track.title.lower())
 
     # 1. Intentar obtener el Mix/Radio de recomendados de YouTube (list=RD<video_id>)
-    if last_track.video_id:
+    if last_track.video_id and len(str(last_track.video_id)) == 11:
         mix_url = f"https://www.youtube.com/watch?v={last_track.video_id}&list=RD{last_track.video_id}"
         mix_opts = build_ytdl_options(allow_playlist=True, flat_playlist=True, playlist_end=20)
+        mix_opts["ignoreerrors"] = True
         try:
             with yt_dlp.YoutubeDL(mix_opts) as ytdl:
                 mix_info = ytdl.extract_info(mix_url, download=False)
@@ -314,11 +427,11 @@ def fetch_recommended_track(
                     if not entry:
                         continue
                     cand_id = entry.get("id")
-                    cand_url = entry.get("webpage_url") or entry.get("url")
-                    if cand_id and cand_id not in history_set:
+                    cand_title = entry.get("title") or "Recomendación"
+                    if cand_id and cand_id not in history_set and cand_title.lower() not in history_set:
                         webpage = f"https://www.youtube.com/watch?v={cand_id}"
                         candidate = Track(
-                            title=entry.get("title") or "Recomendación",
+                            title=cand_title,
                             webpage_url=webpage,
                             video_id=cand_id,
                             duration=entry.get("duration"),
@@ -330,30 +443,41 @@ def fetch_recommended_track(
         except Exception as exc:
             logger.warning(f"Fallo al consultar Mix RD para {last_track.video_id}: {exc}")
 
-    # 2. Respaldo: buscar pistas similares en YouTube
-    fallback_opts = build_ytdl_options(allow_playlist=False, flat_playlist=True, playlist_end=10)
-    search_query = f"ytsearch10:{last_track.title} mix"
+    # 2. Respaldo en SoundCloud para recomendados sin bloqueo de IP
+    sc_opts = build_ytdl_options(
+        allow_playlist=False,
+        flat_playlist=False,
+        playlist_end=10,
+        default_search="scsearch",
+    )
+    search_query = f"scsearch8:{last_track.title}"
     try:
-        with yt_dlp.YoutubeDL(fallback_opts) as ytdl:
+        with yt_dlp.YoutubeDL(sc_opts) as ytdl:
             search_info = ytdl.extract_info(search_query, download=False)
         if search_info and "entries" in search_info:
             for entry in search_info.get("entries") or []:
                 if not entry:
                     continue
-                cand_id = entry.get("id")
+                cand_id = str(entry.get("id", ""))
                 cand_title = entry.get("title", "")
-                if cand_id and cand_id not in history_set and cand_title.lower() != last_track.title.lower():
-                    webpage = f"https://www.youtube.com/watch?v={cand_id}"
-                    candidate = Track(
+                cand_stream = entry.get("url")
+                if (
+                    cand_stream
+                    and cand_id not in history_set
+                    and cand_title.lower() not in history_set
+                    and cand_title.lower() != last_track.title.lower()
+                ):
+                    return Track(
                         title=cand_title or "Recomendación",
-                        webpage_url=webpage,
+                        webpage_url=entry.get("webpage_url") or last_track.webpage_url,
+                        stream_url=cand_stream,
                         video_id=cand_id,
                         duration=entry.get("duration"),
+                        thumbnail=entry.get("thumbnail"),
                         requester=bot_user,
                         is_autoplay=True,
                         based_on_title=last_track.title,
                     )
-                    return resolve_track_stream(candidate)
     except Exception as exc:
         logger.warning(f"Fallo en búsqueda de recomendados de respaldo: {exc}")
 
@@ -389,7 +513,6 @@ class MusicCog(commands.Cog, name="Música"):
         if state.queue:
             next_track = state.queue.popleft()
         elif state.autoplay and state.last_track and self.bot.user:
-            # Si la cola se vació y Autoplay está activado, buscamos una canción recomendada
             seed_track = state.last_track
             history_snapshot = list(state.history_ids)
             try:
@@ -408,7 +531,6 @@ class MusicCog(commands.Cog, name="Música"):
             state.current = None
             return
 
-        # Si el track viene de una playlist (lazy loading), resolvemos su stream ahora
         if not next_track.stream_url:
             try:
                 next_track = await self.bot.loop.run_in_executor(
@@ -610,7 +732,7 @@ class MusicCog(commands.Cog, name="Música"):
 
         state = self.get_state(ctx.guild.id)
         skipped_title = state.current.title if state.current else "Canción actual"
-        voice_client.stop()  # Dispara after_playback -> play_next
+        voice_client.stop()
         await ctx.send(
             embed=discord.Embed(
                 description=f"⏭️ Se saltó **{skipped_title}**.",
@@ -734,7 +856,7 @@ class MusicCog(commands.Cog, name="Música"):
         state = self.get_state(ctx.guild.id)
         state.queue.clear()
         state.current = None
-        state.last_track = None  # Evita que se dispare Autoplay tras hacer !stop
+        state.last_track = None
 
         if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
             voice_client.stop()
@@ -789,7 +911,6 @@ class MusicCog(commands.Cog, name="Música"):
 
         state = self.get_state(member.guild.id)
 
-        # Si el propio bot fue desconectado manualmente o movido fuera
         if self.bot.user and member.id == self.bot.user.id and after.channel is None:
             state.clear()
             return
@@ -806,7 +927,7 @@ class MusicCog(commands.Cog, name="Música"):
 
     async def _disconnect_after_inactivity(self, guild: discord.Guild) -> None:
         try:
-            await asyncio.sleep(180)  # 3 minutos
+            await asyncio.sleep(180)
             voice_client: Optional[discord.VoiceClient] = guild.voice_client
             if voice_client and voice_client.is_connected() and voice_client.channel:
                 non_bot_members = [m for m in voice_client.channel.members if not m.bot]
@@ -914,7 +1035,7 @@ async def _handle_http_client(
 
 
 async def start_healthcheck_server() -> None:
-    """Mini servidor HTTP para poder usar el Plan Gratis ($0) de Render.com / Koyeb."""
+    """Mini servidor HTTP para poder usar el Plan Gratis ($0) de Render.com."""
     port = int(os.getenv("PORT", "8080"))
     try:
         server = await asyncio.start_server(_handle_http_client, "0.0.0.0", port)
@@ -923,20 +1044,15 @@ async def start_healthcheck_server() -> None:
         logger.warning(f"No se pudo iniciar el servidor health-check en el puerto {port}: {exc}")
         return
 
-    # Auto-ping cada 10 minutos si RENDER_EXTERNAL_URL está definido para evitar suspensión
-    external_url = os.getenv("RENDER_EXTERNAL_URL")
-    if external_url:
-        while True:
-            await asyncio.sleep(600)
-            try:
-                await asyncio.get_running_loop().run_in_executor(
-                    None, urllib.request.urlopen, external_url
-                )
-            except Exception:
-                pass
-    else:
-        async with server:
-            await server.serve_forever()
+    external_url = os.getenv("RENDER_EXTERNAL_URL", "https://elcompitamusica-1.onrender.com")
+    while True:
+        await asyncio.sleep(600)
+        try:
+            await asyncio.get_running_loop().run_in_executor(
+                None, urllib.request.urlopen, external_url
+            )
+        except Exception:
+            pass
 
 
 def main() -> None:
