@@ -118,29 +118,50 @@ FFMPEG_OPTIONS = {
 
 
 def is_playlist_query(query: str) -> bool:
-    """Detecta si el usuario envió una URL de playlist o mix."""
+    """Detecta si el usuario envió una URL de playlist real (ignorando mixes automáticos RD... si tienen v=)."""
     if not query.startswith(("http://", "https://")):
         return False
     parsed = urlparse(query)
     qs = parse_qs(parsed.query)
-    if "list" in qs:
-        return True
     if "/playlist" in parsed.path or "/sets/" in parsed.path or "/album/" in parsed.path:
+        return True
+    if "list" in qs:
+        list_id = qs["list"][0]
+        # Si el link tiene un video (v=) y la lista es un radio automático (RD...), reproducir la canción y dejar que Autoplay siga
+        if "v" in qs and list_id.startswith("RD"):
+            return False
         return True
     return False
 
 
-def fetch_youtube_oembed_title(url: str) -> Optional[str]:
-    """Obtiene el título de un video de YouTube vía oEmbed público (no requiere cookies ni sufre bloqueos de IP)."""
+def normalize_youtube_video_url(url: str) -> str:
+    """Convierte enlaces de music.youtube.com o youtu.be a formato estándar www.youtube.com/watch?v=ID."""
     try:
-        oembed_url = f"https://www.youtube.com/oembed?url={quote(url, safe='')}&format=json"
+        parsed = urlparse(url)
+        if "youtu.be" in parsed.netloc:
+            vid_id = parsed.path.lstrip("/").split("/")[0]
+            if vid_id:
+                return f"https://www.youtube.com/watch?v={vid_id}"
+        qs = parse_qs(parsed.query)
+        if "v" in qs and qs["v"]:
+            return f"https://www.youtube.com/watch?v={qs['v'][0]}"
+    except Exception:
+        pass
+    return url
+
+
+def fetch_youtube_oembed_title(url: str) -> Optional[str]:
+    """Obtiene el título de un video de YouTube/YouTube Music vía oEmbed público (no requiere cookies ni sufre bloqueos)."""
+    try:
+        clean_url = normalize_youtube_video_url(url)
+        oembed_url = f"https://www.youtube.com/oembed?url={quote(clean_url, safe='')}&format=json"
         req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
             data = json.loads(resp.read().decode("utf-8"))
             title = data.get("title")
-            author = data.get("author_name", "")
+            author = data.get("author_name", "").replace(" - Topic", "").strip()
             if title and author and author.lower() not in title.lower():
-                return f"{title} {author}"
+                return f"{author} - {title}"
             return title
     except Exception:
         return None
@@ -206,41 +227,87 @@ class GuildMusicState:
 
 
 def _extract_from_soundcloud(search_text: str, requester: discord.abc.User) -> Track:
-    """Respaldo automático con SoundCloud cuando la IP de la nube es bloqueada por YouTube sin cookies."""
+    """
+    Respaldo automático con SoundCloud cuando la IP de la nube es bloqueada por YouTube.
+    Busca hasta 10 candidatos y salta automáticamente pistas con DRM o previews de 30 segundos (SoundCloud Go+).
+    """
     clean_query = search_text.strip()
-    for noise in ("(Official Video)", "(Video Oficial)", "[Official Video]", "(Official Audio)", "(Lyrics)", "(Letra)"):
+    for noise in ("(Official Video)", "(Video Oficial)", "[Official Video]", "(Official Audio)", "(Lyrics)", "(Letra)", " - Topic"):
         clean_query = clean_query.replace(noise, "").replace(noise.lower(), "")
-    sc_opts = build_ytdl_options(
+    clean_query = clean_query.strip()
+
+    # Si el usuario pasó directamente un link de SoundCloud
+    if clean_query.startswith(("http://", "https://")) and "soundcloud.com" in clean_query:
+        sc_single_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False)
+        with yt_dlp.YoutubeDL(sc_single_opts) as ytdl:
+            info = ytdl.extract_info(clean_query, download=False)
+        if info and info.get("url"):
+            return Track(
+                title=info.get("title", clean_query),
+                webpage_url=info.get("webpage_url") or clean_query,
+                stream_url=info["url"],
+                video_id=str(info.get("id", "")),
+                duration=info.get("duration"),
+                thumbnail=info.get("thumbnail"),
+                requester=requester,
+            )
+
+    # 1. Obtener lista rápida de hasta 10 resultados en SoundCloud
+    flat_opts = build_ytdl_options(
         allow_playlist=False,
-        flat_playlist=False,
+        flat_playlist=True,
+        playlist_end=10,
         default_search="scsearch",
     )
-    target = clean_query if clean_query.startswith(("http://", "https://", "scsearch")) else f"scsearch1:{clean_query}"
-    with yt_dlp.YoutubeDL(sc_opts) as ytdl:
-        info = ytdl.extract_info(target, download=False)
+    flat_opts["ignoreerrors"] = True
 
-    if not info:
-        raise ValueError(f"No se encontró audio para '{search_text}'.")
+    with yt_dlp.YoutubeDL(flat_opts) as ytdl:
+        search_info = ytdl.extract_info(f"scsearch10:{clean_query}", download=False)
 
-    if "entries" in info:
-        entries = [e for e in info.get("entries", []) if e]
-        if not entries:
-            raise ValueError(f"No se encontraron resultados para '{search_text}'.")
-        info = entries[0]
+    entries = [e for e in (search_info or {}).get("entries", []) if e]
+    if not entries:
+        raise ValueError(f"No se encontraron resultados disponibles para '{search_text}'.")
 
-    stream_url = info.get("url")
-    if not stream_url:
-        raise ValueError(f"No se pudo obtener stream de audio para '{search_text}'.")
+    stream_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False)
+    fallback_preview_track: Optional[Track] = None
 
-    return Track(
-        title=info.get("title", search_text),
-        webpage_url=info.get("webpage_url") or search_text,
-        stream_url=stream_url,
-        video_id=info.get("id"),
-        duration=info.get("duration"),
-        thumbnail=info.get("thumbnail"),
-        requester=requester,
-    )
+    # 2. Probar cada candidato hasta encontrar el primero sin DRM y de duración completa (>35s)
+    for entry in entries:
+        cand_url = entry.get("url") or entry.get("webpage_url")
+        if not cand_url:
+            continue
+        try:
+            with yt_dlp.YoutubeDL(stream_opts) as ytdl:
+                track_info = ytdl.extract_info(cand_url, download=False)
+            if not track_info or not track_info.get("url"):
+                continue
+
+            duration = track_info.get("duration") or entry.get("duration")
+            candidate_track = Track(
+                title=track_info.get("title") or entry.get("title") or clean_query,
+                webpage_url=track_info.get("webpage_url") or cand_url,
+                stream_url=track_info["url"],
+                video_id=str(track_info.get("id", "")),
+                duration=duration,
+                thumbnail=track_info.get("thumbnail"),
+                requester=requester,
+            )
+
+            # Evitar previews de 30 segundos de SoundCloud Go+ si hay pistas completas disponibles
+            if duration and 25 <= int(duration) <= 35:
+                if fallback_preview_track is None:
+                    fallback_preview_track = candidate_track
+                continue
+
+            return candidate_track
+        except Exception as exc:
+            logger.debug(f"Saltando candidato SoundCloud ({cand_url}) por DRM/error: {exc}")
+            continue
+
+    if fallback_preview_track is not None:
+        return fallback_preview_track
+
+    raise ValueError(f"Todas las versiones encontradas para '{clean_query}' tenían restricción DRM.")
 
 
 def extract_tracks(query: str, requester: discord.abc.User) -> List[Track]:
@@ -443,16 +510,18 @@ def fetch_recommended_track(
         except Exception as exc:
             logger.warning(f"Fallo al consultar Mix RD para {last_track.video_id}: {exc}")
 
-    # 2. Respaldo en SoundCloud para recomendados sin bloqueo de IP
-    sc_opts = build_ytdl_options(
+    # 2. Respaldo en SoundCloud para recomendados sin bloqueo de IP ni DRM
+    sc_flat_opts = build_ytdl_options(
         allow_playlist=False,
-        flat_playlist=False,
-        playlist_end=10,
+        flat_playlist=True,
+        playlist_end=12,
         default_search="scsearch",
     )
-    search_query = f"scsearch8:{last_track.title}"
+    sc_flat_opts["ignoreerrors"] = True
+    stream_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False)
+    search_query = f"scsearch12:{last_track.title}"
     try:
-        with yt_dlp.YoutubeDL(sc_opts) as ytdl:
+        with yt_dlp.YoutubeDL(sc_flat_opts) as ytdl:
             search_info = ytdl.extract_info(search_query, download=False)
         if search_info and "entries" in search_info:
             for entry in search_info.get("entries") or []:
@@ -460,24 +529,35 @@ def fetch_recommended_track(
                     continue
                 cand_id = str(entry.get("id", ""))
                 cand_title = entry.get("title", "")
-                cand_stream = entry.get("url")
+                cand_url = entry.get("url") or entry.get("webpage_url")
                 if (
-                    cand_stream
-                    and cand_id not in history_set
-                    and cand_title.lower() not in history_set
-                    and cand_title.lower() != last_track.title.lower()
+                    not cand_url
+                    or cand_id in history_set
+                    or cand_title.lower() in history_set
+                    or cand_title.lower() == last_track.title.lower()
                 ):
+                    continue
+                try:
+                    with yt_dlp.YoutubeDL(stream_opts) as ytdl_stream:
+                        track_info = ytdl_stream.extract_info(cand_url, download=False)
+                    if not track_info or not track_info.get("url"):
+                        continue
+                    duration = track_info.get("duration") or entry.get("duration")
+                    if duration and 25 <= int(duration) <= 35:
+                        continue
                     return Track(
-                        title=cand_title or "Recomendación",
-                        webpage_url=entry.get("webpage_url") or last_track.webpage_url,
-                        stream_url=cand_stream,
-                        video_id=cand_id,
-                        duration=entry.get("duration"),
-                        thumbnail=entry.get("thumbnail"),
+                        title=track_info.get("title") or cand_title or "Recomendación",
+                        webpage_url=track_info.get("webpage_url") or cand_url,
+                        stream_url=track_info["url"],
+                        video_id=str(track_info.get("id") or cand_id),
+                        duration=duration,
+                        thumbnail=track_info.get("thumbnail"),
                         requester=bot_user,
                         is_autoplay=True,
                         based_on_title=last_track.title,
                     )
+                except Exception:
+                    continue
     except Exception as exc:
         logger.warning(f"Fallo en búsqueda de recomendados de respaldo: {exc}")
 
