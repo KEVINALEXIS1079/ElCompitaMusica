@@ -5,6 +5,7 @@ import logging
 import os
 from typing import Any, Deque, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
+import urllib.request
 
 import discord
 from discord.ext import commands
@@ -804,6 +805,7 @@ class ElCompitaBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.add_cog(MusicCog(self))
+        self.loop.create_task(start_healthcheck_server())
         try:
             synced = await self.tree.sync()
             logger.info(f"Se sincronizaron {len(synced)} comandos híbridos/slash.")
@@ -849,6 +851,57 @@ class ElCompitaBot(commands.Bot):
                 color=discord.Color.red(),
             )
         )
+
+
+async def _handle_http_client(
+    reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+) -> None:
+    try:
+        await reader.read(1024)
+        body = b"OK - ElCompitaMusica is running"
+        response = (
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/plain; charset=utf-8\r\n"
+            + f"Content-Length: {len(body)}\r\n".encode("ascii")
+            + b"Connection: close\r\n\r\n"
+            + body
+        )
+        writer.write(response)
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+
+
+async def start_healthcheck_server() -> None:
+    """Mini servidor HTTP para poder usar el Plan Gratis ($0) de Render.com / Koyeb."""
+    port = int(os.getenv("PORT", "8080"))
+    try:
+        server = await asyncio.start_server(_handle_http_client, "0.0.0.0", port)
+        logger.info(f"🌐 Servidor Health-Check escuchando en el puerto {port} (compatible con Render Free).")
+    except Exception as exc:
+        logger.warning(f"No se pudo iniciar el servidor health-check en el puerto {port}: {exc}")
+        return
+
+    # Auto-ping cada 10 minutos si RENDER_EXTERNAL_URL está definido para evitar suspensión
+    external_url = os.getenv("RENDER_EXTERNAL_URL")
+    if external_url:
+        while True:
+            await asyncio.sleep(600)
+            try:
+                await asyncio.get_running_loop().run_in_executor(
+                    None, urllib.request.urlopen, external_url
+                )
+            except Exception:
+                pass
+    else:
+        async with server:
+            await server.serve_forever()
 
 
 def main() -> None:
