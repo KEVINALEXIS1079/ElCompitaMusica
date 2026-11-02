@@ -1,0 +1,9 @@
+services:
+  el-compita-musica:
+    build: .
+    container_name: el_compita_musica
+    env_file:
+      - .env
+    volumes:
+      - ./main.py:/app/main.py
+    restart: unless-stopped
