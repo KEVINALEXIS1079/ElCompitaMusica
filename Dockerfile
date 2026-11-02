@@ -6,6 +6,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
+    nodejs \
     libffi-dev \
     libnacl-dev \
     python3-dev \

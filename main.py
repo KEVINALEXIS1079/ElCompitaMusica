@@ -12,19 +12,7 @@ from discord.ext import commands
 from dotenv import load_dotenv
 import yt_dlp
 
-# Cargar variables de entorno
-load_dotenv()
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
-COOKIES_FILE = "cookies.txt"
-
-# Si se configuró YOUTUBE_COOKIES como variable de entorno en la nube (Railway/Render/Fly), escribir cookies.txt
-if YOUTUBE_COOKIES and not os.path.isfile(COOKIES_FILE):
-    try:
-        with open(COOKIES_FILE, "w", encoding="utf-8") as f:
-            f.write(YOUTUBE_COOKIES)
-    except Exception:
-        pass
+import shutil
 
 # Configuración de logging
 logging.basicConfig(
@@ -32,6 +20,53 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
 )
 logger = logging.getLogger("ElCompitaMusica")
+
+# Cargar variables de entorno
+load_dotenv()
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
+YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
+COOKIES_FILE = "/tmp/cookies.txt" if os.name != "nt" else "cookies.txt"
+
+
+def prepare_cookies_file() -> Optional[str]:
+    """
+    Prepara un archivo cookies.txt escribible en /tmp/cookies.txt a partir de:
+    1. Secret Files de Render (/etc/secrets/cookies.txt)
+    2. Archivo local ./cookies.txt
+    3. Variable de entorno YOUTUBE_COOKIES
+    """
+    if os.path.isfile("/etc/secrets/cookies.txt") and os.path.getsize("/etc/secrets/cookies.txt") > 0:
+        try:
+            shutil.copyfile("/etc/secrets/cookies.txt", COOKIES_FILE)
+            logger.info("✅ Cookies de YouTube cargadas desde /etc/secrets/cookies.txt")
+            return COOKIES_FILE
+        except Exception as exc:
+            logger.warning(f"No se pudo copiar /etc/secrets/cookies.txt: {exc}")
+
+    if os.path.isfile("cookies.txt") and os.path.getsize("cookies.txt") > 0:
+        if COOKIES_FILE != "cookies.txt":
+            try:
+                shutil.copyfile("cookies.txt", COOKIES_FILE)
+                logger.info("✅ Cookies de YouTube cargadas desde ./cookies.txt")
+                return COOKIES_FILE
+            except Exception:
+                return "cookies.txt"
+        logger.info("✅ Cookies de YouTube cargadas desde ./cookies.txt")
+        return "cookies.txt"
+
+    if YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip():
+        try:
+            with open(COOKIES_FILE, "w", encoding="utf-8") as f:
+                f.write(YOUTUBE_COOKIES.strip() + "\n")
+            logger.info("✅ Cookies de YouTube cargadas desde variable YOUTUBE_COOKIES")
+            return COOKIES_FILE
+        except Exception as exc:
+            logger.warning(f"No se pudo escribir YOUTUBE_COOKIES: {exc}")
+
+    return None
+
+
+ACTIVE_COOKIES_FILE = prepare_cookies_file()
 
 # Silenciar logs de bug reports de yt-dlp
 yt_dlp.utils.bug_reports_message = lambda *args, **kwargs: ""
@@ -50,8 +85,8 @@ def build_ytdl_options(*, allow_playlist: bool = False, flat_playlist: bool = Fa
         "playlistend": playlist_end,
         "source_address": "0.0.0.0",
     }
-    if os.path.isfile(COOKIES_FILE) and os.path.getsize(COOKIES_FILE) > 0:
-        opts["cookiefile"] = COOKIES_FILE
+    if ACTIVE_COOKIES_FILE and os.path.isfile(ACTIVE_COOKIES_FILE):
+        opts["cookiefile"] = ACTIVE_COOKIES_FILE
     return opts
 
 
