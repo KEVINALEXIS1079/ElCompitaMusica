@@ -6,4 +6,5 @@ services:
       - .env
     volumes:
       - ./main.py:/app/main.py
-    restart: unless-stopped
+      - ./cookies.txt:/app/cookies.txt
+    restart: "no"

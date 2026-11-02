@@ -1,10 +1,15 @@
 import asyncio
+import base64
 from collections import deque
 from dataclasses import dataclass
+import hashlib
+import hmac
 import json
 import logging
 import os
 import shutil
+import tempfile
+import uuid
 from typing import Any, Deque, Dict, List, Optional
 from urllib.parse import parse_qs, quote, urlparse
 import urllib.request
@@ -25,64 +30,120 @@ logger = logging.getLogger("ElCompitaMusica")
 load_dotenv()
 DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
-COOKIES_FILE = "/tmp/cookies.txt" if os.name != "nt" else "cookies.txt"
+
+TEMP_DIR = tempfile.gettempdir()
+AUDIO_CACHE_DIR = os.path.join(TEMP_DIR, "elcompita_audio")
+os.makedirs(AUDIO_CACHE_DIR, exist_ok=True)
+
+COOKIES_MASTER_FILE = os.path.join(TEMP_DIR, "cookies_master.txt")
+COOKIES_WORKING_FILE = os.path.join(TEMP_DIR, "cookies_working.txt")
 
 # Silenciar logs de bug reports de yt-dlp
 yt_dlp.utils.bug_reports_message = lambda *args, **kwargs: ""
 
 
+def _decrypt_cookies_enc(enc_path: str, secret_key: str) -> Optional[str]:
+    """Desencripta cookies.enc en memoria usando DISCORD_TOKEN (PBKDF2-HMAC-SHA256 + HMAC-SHA256)."""
+    try:
+        with open(enc_path, "r", encoding="utf-8") as f:
+            raw_b64 = f.read().strip()
+        raw = base64.b64decode(raw_b64)
+        if len(raw) <= 48:
+            return None
+        salt = raw[:16]
+        mac = raw[16:48]
+        ciphertext = raw[48:]
+
+        key_bytes = secret_key.strip().encode("utf-8")
+        expected_mac = hmac.new(key_bytes, salt + ciphertext, hashlib.sha256).digest()
+        if not hmac.compare_digest(mac, expected_mac):
+            logger.warning("La firma HMAC de cookies.enc no coincide con DISCORD_TOKEN.")
+            return None
+
+        keystream = hashlib.pbkdf2_hmac("sha256", key_bytes, salt, 100000, dklen=len(ciphertext))
+        plaintext = bytes(c ^ k for c, k in zip(ciphertext, keystream))
+        return plaintext.decode("utf-8")
+    except Exception as exc:
+        logger.warning(f"No se pudo desencriptar {enc_path}: {exc}")
+        return None
+
+
 def prepare_cookies_file() -> Optional[str]:
     """
-    Detecta y prepara un archivo cookies.txt escribible en /tmp/cookies.txt buscando en:
-    1. Cualquier archivo dentro de /etc/secrets/ (Secret Files de Render)
-    2. Cualquier archivo *cookie*.txt en el directorio actual
-    3. Variable de entorno YOUTUBE_COOKIES
+    Detecta y prepara un archivo maestro de cookies de YouTube buscando en:
+    1. /etc/secrets/ (Render Secret Files)
+    2. ./cookies.txt local
+    3. Variable de entorno YOUTUBE_COOKIES (texto plano o Base64)
+    4. ./cookies.enc (encriptado con DISCORD_TOKEN)
     """
     # 1. Revisar /etc/secrets (Render Secret Files)
     secrets_dir = "/etc/secrets"
     if os.path.isdir(secrets_dir):
         try:
-            secret_files = os.listdir(secrets_dir)
-            logger.info(f"📂 Archivos detectados en /etc/secrets: {secret_files}")
-            for fname in secret_files:
+            for fname in os.listdir(secrets_dir):
                 fpath = os.path.join(secrets_dir, fname)
                 if os.path.isfile(fpath) and os.path.getsize(fpath) > 0:
                     if "cookie" in fname.lower() or "youtube" in fname.lower():
-                        shutil.copyfile(fpath, COOKIES_FILE)
-                        logger.info(f"✅ Cookies de YouTube cargadas desde {fpath} ({os.path.getsize(fpath)} bytes)")
-                        return COOKIES_FILE
+                        shutil.copyfile(fpath, COOKIES_MASTER_FILE)
+                        shutil.copyfile(COOKIES_MASTER_FILE, COOKIES_WORKING_FILE)
+                        logger.info(f"✅ Cookies de YouTube cargadas desde {fpath}")
+                        return COOKIES_WORKING_FILE
         except Exception as exc:
             logger.warning(f"Error inspeccionando /etc/secrets: {exc}")
 
-    # 2. Revisar directorio actual por cookies.txt o *cookies*.txt
-    try:
-        for fname in os.listdir("."):
-            if os.path.isfile(fname) and "cookie" in fname.lower() and fname.endswith(".txt"):
-                if os.path.getsize(fname) > 0:
-                    if COOKIES_FILE != fname:
-                        shutil.copyfile(fname, COOKIES_FILE)
-                        logger.info(f"✅ Cookies de YouTube cargadas desde ./{fname}")
-                        return COOKIES_FILE
-                    logger.info(f"✅ Cookies de YouTube cargadas desde ./{fname}")
-                    return fname
-    except Exception:
-        pass
+    # 2. Revisar directorio actual por cookies.txt
+    if os.path.isfile("cookies.txt") and os.path.getsize("cookies.txt") > 0:
+        try:
+            shutil.copyfile("cookies.txt", COOKIES_MASTER_FILE)
+            shutil.copyfile(COOKIES_MASTER_FILE, COOKIES_WORKING_FILE)
+            logger.info("✅ Cookies de YouTube cargadas desde ./cookies.txt")
+            return COOKIES_WORKING_FILE
+        except Exception as exc:
+            logger.warning(f"Error copiando ./cookies.txt: {exc}")
 
     # 3. Revisar variable de entorno YOUTUBE_COOKIES
     if YOUTUBE_COOKIES and YOUTUBE_COOKIES.strip():
         try:
-            with open(COOKIES_FILE, "w", encoding="utf-8") as f:
-                f.write(YOUTUBE_COOKIES.strip() + "\n")
-            logger.info("✅ Cookies de YouTube cargadas desde la variable YOUTUBE_COOKIES")
-            return COOKIES_FILE
+            content = YOUTUBE_COOKIES.strip()
+            if not content.startswith("#") and ".youtube.com" not in content:
+                content = base64.b64decode(content).decode("utf-8")
+            with open(COOKIES_MASTER_FILE, "w", encoding="utf-8") as f:
+                f.write(content.strip() + "\n")
+            shutil.copyfile(COOKIES_MASTER_FILE, COOKIES_WORKING_FILE)
+            logger.info("✅ Cookies de YouTube cargadas desde YOUTUBE_COOKIES")
+            return COOKIES_WORKING_FILE
         except Exception as exc:
-            logger.warning(f"No se pudo escribir YOUTUBE_COOKIES: {exc}")
+            logger.warning(f"No se pudo procesar YOUTUBE_COOKIES: {exc}")
 
-    logger.info("ℹ️ No se detectó archivo cookies.txt; se usará modo híbrido (YouTube + respaldo automático SoundCloud).")
+    # 4. Revisar cookies.enc encriptado con DISCORD_TOKEN
+    if os.path.isfile("cookies.enc") and DISCORD_TOKEN:
+        decrypted = _decrypt_cookies_enc("cookies.enc", DISCORD_TOKEN)
+        if decrypted and ".youtube.com" in decrypted:
+            try:
+                with open(COOKIES_MASTER_FILE, "w", encoding="utf-8") as f:
+                    f.write(decrypted.strip() + "\n")
+                shutil.copyfile(COOKIES_MASTER_FILE, COOKIES_WORKING_FILE)
+                logger.info("✅ Cookies de YouTube desencriptadas y activadas desde cookies.enc")
+                return COOKIES_WORKING_FILE
+            except Exception as exc:
+                logger.warning(f"No se pudo escribir cookies desencriptadas: {exc}")
+
+    logger.info("ℹ️ No se detectaron cookies; se usará modo híbrido.")
     return None
 
 
 ACTIVE_COOKIES_FILE = prepare_cookies_file()
+
+
+def get_fresh_cookie_file() -> Optional[str]:
+    """Devuelve una copia fresca del archivo de cookies para evitar que yt-dlp lo corrompa al sobreescribirlo."""
+    if os.path.isfile(COOKIES_MASTER_FILE) and os.path.getsize(COOKIES_MASTER_FILE) > 0:
+        try:
+            shutil.copyfile(COOKIES_MASTER_FILE, COOKIES_WORKING_FILE)
+            return COOKIES_WORKING_FILE
+        except Exception:
+            return COOKIES_MASTER_FILE
+    return ACTIVE_COOKIES_FILE
 
 
 def build_ytdl_options(
@@ -91,10 +152,22 @@ def build_ytdl_options(
     flat_playlist: bool = False,
     playlist_end: int = 100,
     default_search: str = "ytsearch",
+    use_cookies: bool = True,
+    custom_extractor_args: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Construye las opciones de yt-dlp e inyecta cookies.txt si está disponible."""
+    """
+    Construye opciones optimizadas de yt-dlp:
+    - Prioriza streams progresivos HTTPS (opus/webm/m4a) y evita m3u8/HLS segmentados que causan cortes.
+    - Activa Node.js como runtime JS (yt-dlp-ejs) para resolver el n-challenge de YouTube y evitar throttling.
+    """
     opts: Dict[str, Any] = {
-        "format": "bestaudio/best",
+        "format": (
+            "bestaudio[ext=webm][protocol=https]/"
+            "bestaudio[ext=m4a][protocol=https]/"
+            "bestaudio[protocol=https]/"
+            "bestaudio[protocol^=http][protocol!=m3u8][protocol!=m3u8_native]/"
+            "bestaudio/best"
+        ),
         "default_search": default_search,
         "noplaylist": not allow_playlist,
         "quiet": True,
@@ -103,17 +176,41 @@ def build_ytdl_options(
         "extract_flat": "in_playlist" if flat_playlist else False,
         "playlistend": playlist_end,
         "source_address": "0.0.0.0",
+        "geo_bypass": True,
+        "nocheckcertificate": True,
+        "concurrent_fragment_downloads": 4,
+        "buffersize": 65536,
+        "http_chunk_size": 10485760,
+        "retries": 5,
+        "fragment_retries": 5,
+        "js_runtimes": {"node": {}},
     }
-    cookie_path = ACTIVE_COOKIES_FILE or (COOKIES_FILE if os.path.isfile(COOKIES_FILE) else None)
-    if cookie_path and os.path.isfile(cookie_path) and os.path.getsize(cookie_path) > 0:
-        opts["cookiefile"] = cookie_path
+
+    if custom_extractor_args:
+        opts["extractor_args"] = custom_extractor_args
+
+    if use_cookies:
+        cookie_path = get_fresh_cookie_file()
+        if cookie_path and os.path.isfile(cookie_path) and os.path.getsize(cookie_path) > 0:
+            opts["cookiefile"] = cookie_path
+
     return opts
 
 
-# Opciones de FFmpeg con reconexión automática
-FFMPEG_OPTIONS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+# Opciones de FFmpeg para archivos locales en /tmp (cero latencia de red, cero cortes)
+FFMPEG_LOCAL_OPTIONS = {
+    "before_options": "-nostdin -thread_queue_size 4096",
+    "options": "-vn -b:a 128k -bufsize 2M",
+}
+
+# Opciones de FFmpeg para streaming directo con reconexión agresiva y buffer grande
+FFMPEG_STREAM_OPTIONS = {
+    "before_options": (
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
+        "-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5 "
+        "-thread_queue_size 4096 -nostdin"
+    ),
+    "options": "-vn -b:a 128k -bufsize 4M",
 }
 
 
@@ -128,21 +225,37 @@ def is_playlist_query(query: str) -> bool:
     if "list" in qs:
         list_id = qs["list"][0]
         # Si el link tiene un video (v=) y la lista es un radio automático (RD...), reproducir la canción y dejar que Autoplay siga
-        if "v" in qs and list_id.startswith("RD"):
+        if "v" in qs and (list_id.startswith("RD") or list_id.startswith("OLAK")):
             return False
         return True
     return False
 
 
-def normalize_youtube_video_url(url: str) -> str:
-    """Convierte enlaces de music.youtube.com o youtu.be a formato estándar www.youtube.com/watch?v=ID."""
+def normalize_youtube_url(url: str, *, playlist_mode: bool = False) -> str:
+    """
+    Convierte enlaces de music.youtube.com o youtu.be a formato estándar www.youtube.com
+    para máxima compatibilidad con yt-dlp y cookies de .youtube.com.
+    """
+    if not url.startswith(("http://", "https://")):
+        return url
     try:
         parsed = urlparse(url)
-        if "youtu.be" in parsed.netloc:
+        host = parsed.netloc.lower()
+        if "youtube.com" not in host and "youtu.be" not in host:
+            return url
+
+        if "youtu.be" in host:
             vid_id = parsed.path.lstrip("/").split("/")[0]
             if vid_id:
                 return f"https://www.youtube.com/watch?v={vid_id}"
+
         qs = parse_qs(parsed.query)
+        if playlist_mode and "list" in qs and qs["list"]:
+            list_id = qs["list"][0]
+            if "v" in qs and qs["v"] and not list_id.startswith("PL"):
+                return f"https://www.youtube.com/watch?v={qs['v'][0]}&list={list_id}"
+            return f"https://www.youtube.com/playlist?list={list_id}"
+
         if "v" in qs and qs["v"]:
             return f"https://www.youtube.com/watch?v={qs['v'][0]}"
     except Exception:
@@ -151,9 +264,9 @@ def normalize_youtube_video_url(url: str) -> str:
 
 
 def fetch_youtube_oembed_title(url: str) -> Optional[str]:
-    """Obtiene el título de un video de YouTube/YouTube Music vía oEmbed público (no requiere cookies ni sufre bloqueos)."""
+    """Obtiene el título y artista de un video de YouTube/YouTube Music vía oEmbed público."""
     try:
-        clean_url = normalize_youtube_video_url(url)
+        clean_url = normalize_youtube_url(url, playlist_mode=False)
         oembed_url = f"https://www.youtube.com/oembed?url={quote(clean_url, safe='')}&format=json"
         req = urllib.request.Request(oembed_url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=5) as resp:
@@ -169,12 +282,13 @@ def fetch_youtube_oembed_title(url: str) -> Optional[str]:
 
 @dataclass
 class Track:
-    """Representa una pista de audio (con soporte para carga diferida en playlists)."""
+    """Representa una pista de audio con soporte para pre-descarga en /tmp."""
 
     title: str
     webpage_url: str
     requester: discord.abc.User
     stream_url: Optional[str] = None
+    local_file: Optional[str] = None
     video_id: Optional[str] = None
     duration: Optional[int] = None
     thumbnail: Optional[str] = None
@@ -192,8 +306,22 @@ class Track:
         return f"{minutes:02d}:{seconds:02d}"
 
 
+def cleanup_track_file(track: Optional[Track]) -> None:
+    """Elimina el archivo temporal de audio de /tmp cuando termina de sonar."""
+    if not track or not track.local_file:
+        return
+    try:
+        if os.path.isfile(track.local_file):
+            os.remove(track.local_file)
+            logger.debug(f"🧹 Archivo temporal eliminado: {track.local_file}")
+    except Exception:
+        pass
+    finally:
+        track.local_file = None
+
+
 class GuildMusicState:
-    """Administra la cola de reproducción, historial y Autoplay por servidor (guild_id)."""
+    """Administra la cola de reproducción, historial, pre-carga y Autoplay por servidor."""
 
     def __init__(self) -> None:
         self.queue: Deque[Track] = deque()
@@ -203,6 +331,7 @@ class GuildMusicState:
         self.autoplay: bool = True
         self.text_channel: Optional[discord.abc.Messageable] = None
         self.inactivity_task: Optional[asyncio.Task] = None
+        self.prefetch_task: Optional[asyncio.Task] = None
 
     def register_played(self, track: Track) -> None:
         self.current = track
@@ -215,30 +344,91 @@ class GuildMusicState:
             self.history_ids.append(track.title.lower())
 
     def clear(self) -> None:
-        self.queue.clear()
+        while self.queue:
+            t = self.queue.popleft()
+            cleanup_track_file(t)
+        cleanup_track_file(self.current)
         self.current = None
         self.last_track = None
         self.cancel_inactivity_task()
+        self.cancel_prefetch_task()
 
     def cancel_inactivity_task(self) -> None:
         if self.inactivity_task and not self.inactivity_task.done():
             self.inactivity_task.cancel()
             self.inactivity_task = None
 
+    def cancel_prefetch_task(self) -> None:
+        if self.prefetch_task and not self.prefetch_task.done():
+            self.prefetch_task.cancel()
+            self.prefetch_task = None
+
+
+def _extract_single_youtube_info(target_query: str) -> Optional[Dict[str, Any]]:
+    """
+    Intenta extraer la información de un video o búsqueda de YouTube usando múltiples estrategias:
+    1. Con cookies de YouTube + Node.js EJS runtime (cliente web estándar / YouTube Music).
+    2. Con cookies + clientes alternativos (tv, mweb, web_creator).
+    3. Sin cookies + clientes embebidos/móviles (ios, android_vr, tv_embedded).
+    """
+    strategies = [
+        {"use_cookies": True, "custom_extractor_args": None},
+        {
+            "use_cookies": True,
+            "custom_extractor_args": {"youtube": {"player_client": ["tv", "mweb", "web"]}},
+        },
+        {
+            "use_cookies": False,
+            "custom_extractor_args": {"youtube": {"player_client": ["ios", "android_vr", "tv_embedded"]}},
+        },
+    ]
+
+    last_err = None
+    for idx, strat in enumerate(strategies, start=1):
+        opts = build_ytdl_options(
+            allow_playlist=False,
+            flat_playlist=False,
+            use_cookies=strat["use_cookies"],
+            custom_extractor_args=strat["custom_extractor_args"],
+        )
+        try:
+            with yt_dlp.YoutubeDL(opts) as ytdl:
+                info = ytdl.extract_info(target_query, download=False)
+            if info and "entries" in info:
+                entries = [e for e in (info.get("entries") or []) if e]
+                info = entries[0] if entries else None
+            if info and info.get("url"):
+                return info
+        except Exception as exc:
+            last_err = exc
+            logger.debug(f"Estrategia YouTube #{idx} falló para '{target_query}': {exc}")
+
+    if last_err:
+        logger.warning(f"Todas las estrategias directas de YouTube fallaron para '{target_query}': {last_err}")
+    return None
+
 
 def _extract_from_soundcloud(search_text: str, requester: discord.abc.User) -> Track:
     """
-    Respaldo automático con SoundCloud cuando la IP de la nube es bloqueada por YouTube.
-    Busca hasta 10 candidatos y salta automáticamente pistas con DRM o previews de 30 segundos (SoundCloud Go+).
+    Respaldo automático con SoundCloud cuando un video específico tiene bloqueo regional/IP.
+    Prioriza streams HTTP progresivos (no HLS m3u8) y salta pistas con DRM o previews de 30s.
     """
     clean_query = search_text.strip()
-    for noise in ("(Official Video)", "(Video Oficial)", "[Official Video]", "(Official Audio)", "(Lyrics)", "(Letra)", " - Topic"):
+    for noise in (
+        "(Official Video)",
+        "(Video Oficial)",
+        "[Official Video]",
+        "(Official Audio)",
+        "(Audio Oficial)",
+        "(Lyrics)",
+        "(Letra)",
+        " - Topic",
+    ):
         clean_query = clean_query.replace(noise, "").replace(noise.lower(), "")
     clean_query = clean_query.strip()
 
-    # Si el usuario pasó directamente un link de SoundCloud
     if clean_query.startswith(("http://", "https://")) and "soundcloud.com" in clean_query:
-        sc_single_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False)
+        sc_single_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False, use_cookies=False)
         with yt_dlp.YoutubeDL(sc_single_opts) as ytdl:
             info = ytdl.extract_info(clean_query, download=False)
         if info and info.get("url"):
@@ -252,12 +442,12 @@ def _extract_from_soundcloud(search_text: str, requester: discord.abc.User) -> T
                 requester=requester,
             )
 
-    # 1. Obtener lista rápida de hasta 10 resultados en SoundCloud
     flat_opts = build_ytdl_options(
         allow_playlist=False,
         flat_playlist=True,
         playlist_end=10,
         default_search="scsearch",
+        use_cookies=False,
     )
     flat_opts["ignoreerrors"] = True
 
@@ -268,10 +458,9 @@ def _extract_from_soundcloud(search_text: str, requester: discord.abc.User) -> T
     if not entries:
         raise ValueError(f"No se encontraron resultados disponibles para '{search_text}'.")
 
-    stream_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False)
+    stream_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False, use_cookies=False)
     fallback_preview_track: Optional[Track] = None
 
-    # 2. Probar cada candidato hasta encontrar el primero sin DRM y de duración completa (>35s)
     for entry in entries:
         cand_url = entry.get("url") or entry.get("webpage_url")
         if not cand_url:
@@ -293,7 +482,6 @@ def _extract_from_soundcloud(search_text: str, requester: discord.abc.User) -> T
                 requester=requester,
             )
 
-            # Evitar previews de 30 segundos de SoundCloud Go+ si hay pistas completas disponibles
             if duration and 25 <= int(duration) <= 35:
                 if fallback_preview_track is None:
                     fallback_preview_track = candidate_track
@@ -310,146 +498,209 @@ def _extract_from_soundcloud(search_text: str, requester: discord.abc.User) -> T
     raise ValueError(f"Todas las versiones encontradas para '{clean_query}' tenían restricción DRM.")
 
 
+def download_track_to_tmp(track: Track) -> Track:
+    """
+    Descarga la pista de audio en /tmp/elcompita_audio antes de reproducirla (si dura <= 25 min).
+    Al reproducir desde un archivo local en /tmp en lugar de la red en vivo:
+    - Se elimina al 100% el tartamudeo / congelamiento ("que no se trabe la canción").
+    - Se evita el throttling de ancho de banda de YouTube a mitad de la canción.
+    """
+    if track.local_file and os.path.isfile(track.local_file) and os.path.getsize(track.local_file) > 1024:
+        return track
+
+    # Si es una transmisión en vivo o dura más de 25 minutos, usar stream directo
+    if track.duration and int(track.duration) > 1500:
+        return resolve_track_stream(track)
+
+    uid = f"{track.video_id or uuid.uuid4().hex[:8]}_{uuid.uuid4().hex[:6]}"
+    outtmpl = os.path.join(AUDIO_CACHE_DIR, f"{uid}.%(ext)s")
+
+    target = track.webpage_url
+    if not target or not target.startswith(("http://", "https://")):
+        if track.video_id and len(str(track.video_id)) == 11:
+            target = f"https://www.youtube.com/watch?v={track.video_id}"
+        else:
+            target = f"ytsearch1:{track.title}"
+    else:
+        target = normalize_youtube_url(target, playlist_mode=False)
+
+    dl_strategies = [
+        {"use_cookies": True, "custom_extractor_args": None},
+        {
+            "use_cookies": True,
+            "custom_extractor_args": {"youtube": {"player_client": ["tv", "mweb", "web"]}},
+        },
+        {
+            "use_cookies": False,
+            "custom_extractor_args": {"youtube": {"player_client": ["ios", "android_vr", "tv_embedded"]}},
+        },
+    ]
+
+    for strat in dl_strategies:
+        opts = build_ytdl_options(
+            allow_playlist=False,
+            flat_playlist=False,
+            use_cookies=strat["use_cookies"],
+            custom_extractor_args=strat["custom_extractor_args"],
+        )
+        opts["outtmpl"] = outtmpl
+        try:
+            with yt_dlp.YoutubeDL(opts) as ytdl:
+                info = ytdl.extract_info(target, download=True)
+                if info and "entries" in info:
+                    entries = [e for e in (info.get("entries") or []) if e]
+                    info = entries[0] if entries else None
+                if info:
+                    downloaded_path = ytdl.prepare_filename(info)
+                    if os.path.isfile(downloaded_path) and os.path.getsize(downloaded_path) > 1024:
+                        track.local_file = downloaded_path
+                        track.stream_url = info.get("url") or track.stream_url
+                        track.title = info.get("title") or track.title
+                        track.webpage_url = info.get("webpage_url") or track.webpage_url
+                        track.video_id = str(info.get("id") or track.video_id or "")
+                        track.duration = info.get("duration") or track.duration
+                        track.thumbnail = info.get("thumbnail") or track.thumbnail
+                        logger.info(
+                            f"⚡ Audio descargado en caché local ({os.path.getsize(downloaded_path) // 1024} KB): {track.title}"
+                        )
+                        return track
+        except Exception as exc:
+            logger.debug(f"Intento de descarga a /tmp falló para '{target}': {exc}")
+
+    # Si YouTube falló en descarga directa, resolver vía respaldo y descargar también a /tmp
+    track = resolve_track_stream(track)
+    if track.webpage_url and "soundcloud.com" in track.webpage_url:
+        try:
+            sc_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False, use_cookies=False)
+            sc_opts["outtmpl"] = outtmpl
+            with yt_dlp.YoutubeDL(sc_opts) as ytdl:
+                info = ytdl.extract_info(track.webpage_url, download=True)
+                if info:
+                    downloaded_path = ytdl.prepare_filename(info)
+                    if os.path.isfile(downloaded_path) and os.path.getsize(downloaded_path) > 1024:
+                        track.local_file = downloaded_path
+                        logger.info(
+                            f"⚡ Audio de respaldo descargado en caché local ({os.path.getsize(downloaded_path) // 1024} KB): {track.title}"
+                        )
+        except Exception:
+            pass
+
+    return track
+
+
 def extract_tracks(query: str, requester: discord.abc.User) -> List[Track]:
     """
-    Extrae una canción individual o una playlist completa con yt-dlp.
-    Si YouTube bloquea la IP del servidor en la nube por falta de cookies, usa respaldo automático en SoundCloud.
+    Extrae una canción individual o una playlist completa de YouTube, YouTube Music o SoundCloud.
+    Normaliza enlaces de music.youtube.com para evitar errores con parámetros si= o list=RD...
     """
     playlist_mode = is_playlist_query(query)
-    opts = build_ytdl_options(
-        allow_playlist=playlist_mode,
-        flat_playlist=playlist_mode,
-        playlist_end=100,
-    )
-    if playlist_mode:
-        opts["ignoreerrors"] = True
+    normalized_query = normalize_youtube_url(query, playlist_mode=playlist_mode)
 
-    info = None
-    yt_error = None
-    try:
-        with yt_dlp.YoutubeDL(opts) as ytdl:
-            info = ytdl.extract_info(query, download=False)
-    except Exception as exc:
-        yt_error = exc
-        logger.warning(f"Aviso en extracción directa de YouTube ({query}): {exc}")
+    if not playlist_mode:
+        info = _extract_single_youtube_info(normalized_query)
+        if info:
+            webpage = info.get("webpage_url") or normalized_query
+            return [
+                Track(
+                    title=info.get("title", "Título desconocido"),
+                    webpage_url=webpage,
+                    stream_url=info.get("url"),
+                    video_id=str(info.get("id", "")),
+                    duration=info.get("duration"),
+                    thumbnail=info.get("thumbnail"),
+                    requester=requester,
+                )
+            ]
 
-    # Si falló YouTube en pista individual (ej. bloqueo anti-bot en IP de Render), activar respaldo automático
-    if not info and not playlist_mode:
+        # Respaldo automático si un video específico fue bloqueado
         fallback_query = query
         if query.startswith(("http://", "https://")) and ("youtube.com" in query or "youtu.be" in query):
             oembed_title = fetch_youtube_oembed_title(query)
             if oembed_title:
                 fallback_query = oembed_title
             else:
-                raise ValueError(
-                    "YouTube bloqueó la conexión desde la nube. Agrega `cookies.txt` en Render Secret Files o busca la canción por su nombre."
-                )
-        logger.info(f"🔄 Usando respaldo automático de streaming para: '{fallback_query}'")
+                raise ValueError("No se pudo obtener información del enlace de YouTube proporcionado.")
+        logger.info(f"🔄 Usando respaldo automático para: '{fallback_query}'")
         track = _extract_from_soundcloud(fallback_query, requester)
         return [track]
 
+    # Modo Playlist
+    opts = build_ytdl_options(
+        allow_playlist=True,
+        flat_playlist=True,
+        playlist_end=100,
+    )
+    opts["ignoreerrors"] = True
+
+    info = None
+    yt_error = None
+    try:
+        with yt_dlp.YoutubeDL(opts) as ytdl:
+            info = ytdl.extract_info(normalized_query, download=False)
+    except Exception as exc:
+        yt_error = exc
+        logger.warning(f"Aviso en extracción de playlist ({normalized_query}): {exc}")
+
     if not info:
-        raise ValueError(f"No se pudo obtener información del audio solicitado ({yt_error}).")
+        raise ValueError(f"No se pudo obtener la playlist solicitada ({yt_error}).")
 
     tracks: List[Track] = []
+    entries = [e for e in (info.get("entries") or []) if e]
+    if not entries:
+        raise ValueError(f"No se encontraron canciones en la playlist: `{query}`")
 
-    if "entries" in info:
-        entries = [e for e in info.get("entries", []) if e]
-        if not entries:
-            if not playlist_mode:
-                track = _extract_from_soundcloud(query, requester)
-                return [track]
-            raise ValueError(f"No se encontraron resultados para: `{query}`")
+    for entry in entries:
+        vid_id = entry.get("id")
+        raw_url = entry.get("webpage_url") or entry.get("url")
+        if not raw_url and vid_id:
+            raw_url = f"https://www.youtube.com/watch?v={vid_id}"
+        elif raw_url and not raw_url.startswith("http") and vid_id:
+            raw_url = f"https://www.youtube.com/watch?v={vid_id}"
 
-        if not playlist_mode:
-            entry = entries[0]
-            webpage = entry.get("webpage_url") or entry.get("url") or query
-            tracks.append(
-                Track(
-                    title=entry.get("title", "Título desconocido"),
-                    webpage_url=webpage,
-                    stream_url=entry.get("url") if entry.get("acodec") else None,
-                    video_id=entry.get("id"),
-                    duration=entry.get("duration"),
-                    thumbnail=entry.get("thumbnail"),
-                    requester=requester,
-                )
-            )
-        else:
-            for entry in entries:
-                vid_id = entry.get("id")
-                raw_url = entry.get("webpage_url") or entry.get("url")
-                if not raw_url and vid_id:
-                    raw_url = f"https://www.youtube.com/watch?v={vid_id}"
-                elif raw_url and not raw_url.startswith("http") and vid_id:
-                    raw_url = f"https://www.youtube.com/watch?v={vid_id}"
+        if not raw_url:
+            continue
 
-                if not raw_url:
-                    continue
+        thumbnails = entry.get("thumbnails") or []
+        thumb_url = entry.get("thumbnail") or (thumbnails[-1].get("url") if thumbnails else None)
 
-                thumbnails = entry.get("thumbnails") or []
-                thumb_url = entry.get("thumbnail") or (thumbnails[-1].get("url") if thumbnails else None)
-
-                tracks.append(
-                    Track(
-                        title=entry.get("title") or "Canción de la playlist",
-                        webpage_url=raw_url,
-                        stream_url=None,
-                        video_id=vid_id,
-                        duration=entry.get("duration"),
-                        thumbnail=thumb_url,
-                        requester=requester,
-                    )
-                )
-    else:
-        webpage = info.get("webpage_url") or query
         tracks.append(
             Track(
-                title=info.get("title", "Título desconocido"),
-                webpage_url=webpage,
-                stream_url=info.get("url"),
-                video_id=info.get("id"),
-                duration=info.get("duration"),
-                thumbnail=info.get("thumbnail"),
+                title=entry.get("title") or "Canción de la playlist",
+                webpage_url=normalize_youtube_url(raw_url, playlist_mode=False),
+                stream_url=None,
+                video_id=str(vid_id) if vid_id else None,
+                duration=entry.get("duration"),
+                thumbnail=thumb_url,
                 requester=requester,
             )
         )
 
     if not tracks:
-        raise ValueError("No se encontraron pistas reproducibles en el enlace proporcionado.")
+        raise ValueError("No se encontraron pistas reproducibles en la playlist.")
 
     return tracks
 
 
 def resolve_track_stream(track: Track) -> Track:
-    """Resuelve el stream de audio real de un Track; si YouTube bloquea la IP, resuelve por título en SoundCloud."""
+    """Resuelve el stream de audio real de un Track."""
     if track.stream_url:
         return track
 
-    opts = build_ytdl_options(allow_playlist=False, flat_playlist=False)
-    target = track.webpage_url or (f"https://www.youtube.com/watch?v={track.video_id}" if track.video_id else track.title)
+    target = track.webpage_url or (
+        f"https://www.youtube.com/watch?v={track.video_id}" if track.video_id else track.title
+    )
+    target = normalize_youtube_url(target, playlist_mode=False)
 
-    info = None
-    try:
-        with yt_dlp.YoutubeDL(opts) as ytdl:
-            info = ytdl.extract_info(target, download=False)
-    except Exception as exc:
-        logger.warning(f"Resolución directa en YouTube falló para '{track.title}', usando respaldo: {exc}")
-
-    if info and "entries" in info:
-        entries = [e for e in info.get("entries", []) if e]
-        info = entries[0] if entries else None
-
+    info = _extract_single_youtube_info(target)
     if info and info.get("url"):
         track.stream_url = info.get("url")
         track.title = info.get("title") or track.title
         track.webpage_url = info.get("webpage_url") or track.webpage_url
-        track.video_id = info.get("id") or track.video_id
+        track.video_id = str(info.get("id") or track.video_id or "")
         track.duration = info.get("duration") or track.duration
         track.thumbnail = info.get("thumbnail") or track.thumbnail
         return track
 
-    # Respaldo con SoundCloud usando el título de la pista
     search_title = track.title
     if (not search_title or search_title == "Canción de la playlist") and track.webpage_url:
         oembed_title = fetch_youtube_oembed_title(track.webpage_url)
@@ -458,6 +709,7 @@ def resolve_track_stream(track: Track) -> Track:
 
     sc_track = _extract_from_soundcloud(search_title, track.requester)
     track.stream_url = sc_track.stream_url
+    track.webpage_url = sc_track.webpage_url or track.webpage_url
     track.title = track.title if track.title != "Canción de la playlist" else sc_track.title
     track.duration = track.duration or sc_track.duration
     track.thumbnail = track.thumbnail or sc_track.thumbnail
@@ -471,7 +723,7 @@ def fetch_recommended_track(
 ) -> Optional[Track]:
     """
     Obtiene una canción recomendada automáticamente usando el Mix/Radio oficial de YouTube (RD<video_id>)
-    o búsqueda relacionada en YouTube/SoundCloud, evitando repetir canciones recientes.
+    o búsqueda relacionada, evitando repetir canciones recientes.
     """
     history_set = set(history_ids)
     if last_track.video_id:
@@ -506,23 +758,59 @@ def fetch_recommended_track(
                             is_autoplay=True,
                             based_on_title=last_track.title,
                         )
-                        return resolve_track_stream(candidate)
+                        return download_track_to_tmp(candidate)
         except Exception as exc:
             logger.warning(f"Fallo al consultar Mix RD para {last_track.video_id}: {exc}")
 
-    # 2. Respaldo en SoundCloud para recomendados sin bloqueo de IP ni DRM
+    # 2. Respaldo por búsqueda en YouTube
+    yt_flat_opts = build_ytdl_options(
+        allow_playlist=False,
+        flat_playlist=True,
+        playlist_end=8,
+        default_search="ytsearch",
+    )
+    yt_flat_opts["ignoreerrors"] = True
+    try:
+        with yt_dlp.YoutubeDL(yt_flat_opts) as ytdl:
+            search_info = ytdl.extract_info(f"ytsearch8:{last_track.title} mix", download=False)
+        for entry in (search_info or {}).get("entries") or []:
+            if not entry:
+                continue
+            cand_id = str(entry.get("id", ""))
+            cand_title = entry.get("title") or ""
+            if (
+                not cand_id
+                or cand_id in history_set
+                or cand_title.lower() in history_set
+                or cand_title.lower() == last_track.title.lower()
+            ):
+                continue
+            candidate = Track(
+                title=cand_title,
+                webpage_url=f"https://www.youtube.com/watch?v={cand_id}",
+                video_id=cand_id,
+                duration=entry.get("duration"),
+                requester=bot_user,
+                is_autoplay=True,
+                based_on_title=last_track.title,
+            )
+            return download_track_to_tmp(candidate)
+    except Exception as exc:
+        logger.debug(f"Fallo en búsqueda YouTube para recomendados: {exc}")
+
+    # 3. Respaldo en SoundCloud
     sc_flat_opts = build_ytdl_options(
         allow_playlist=False,
         flat_playlist=True,
         playlist_end=12,
         default_search="scsearch",
+        use_cookies=False,
     )
     sc_flat_opts["ignoreerrors"] = True
-    stream_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False)
-    search_query = f"scsearch12:{last_track.title}"
+    stream_opts = build_ytdl_options(allow_playlist=False, flat_playlist=False, use_cookies=False)
     try:
         with yt_dlp.YoutubeDL(sc_flat_opts) as ytdl:
-            search_info = ytdl.extract_info(search_query, download=False)
+            search_info = ytdl.extract_info(f"scsearch12:{last_track.title}", download=False)
         if search_info and "entries" in search_info:
             for entry in search_info.get("entries") or []:
                 if not entry:
@@ -545,7 +833,7 @@ def fetch_recommended_track(
                     duration = track_info.get("duration") or entry.get("duration")
                     if duration and 25 <= int(duration) <= 35:
                         continue
-                    return Track(
+                    candidate = Track(
                         title=track_info.get("title") or cand_title or "Recomendación",
                         webpage_url=track_info.get("webpage_url") or cand_url,
                         stream_url=track_info["url"],
@@ -556,6 +844,7 @@ def fetch_recommended_track(
                         is_autoplay=True,
                         based_on_title=last_track.title,
                     )
+                    return download_track_to_tmp(candidate)
                 except Exception:
                     continue
     except Exception as exc:
@@ -576,8 +865,30 @@ class MusicCog(commands.Cog, name="Música"):
             self.states[guild_id] = GuildMusicState()
         return self.states[guild_id]
 
-    async def play_next(self, guild: discord.Guild, error: Optional[Exception] = None) -> None:
-        """Reproduce la siguiente canción en la cola o busca una recomendada si Autoplay está activo."""
+    async def _prefetch_next_in_queue(self, guild: discord.Guild) -> None:
+        """Pre-descarga en segundo plano la siguiente canción de la cola mientras suena la actual."""
+        await asyncio.sleep(2)
+        state = self.get_state(guild.id)
+        if not state.queue:
+            return
+        next_up = state.queue[0]
+        if next_up.local_file and os.path.isfile(next_up.local_file):
+            return
+        try:
+            await self.bot.loop.run_in_executor(None, download_track_to_tmp, next_up)
+        except Exception as exc:
+            logger.debug(f"No se pudo pre-cargar '{next_up.title}': {exc}")
+
+    async def play_next(
+        self,
+        guild: discord.Guild,
+        finished_track: Optional[Track] = None,
+        error: Optional[Exception] = None,
+    ) -> None:
+        """Limpia el archivo anterior y reproduce la siguiente canción en la cola o Autoplay."""
+        if finished_track:
+            cleanup_track_file(finished_track)
+
         if error:
             logger.error(f"Error en el reproductor de {guild.name} ({guild.id}): {error}")
 
@@ -611,30 +922,44 @@ class MusicCog(commands.Cog, name="Música"):
             state.current = None
             return
 
-        if not next_track.stream_url:
-            try:
-                next_track = await self.bot.loop.run_in_executor(
-                    None, resolve_track_stream, next_track
-                )
-            except Exception as exc:
-                logger.warning(f"No se pudo cargar '{next_track.title}': {exc}")
-                if state.text_channel:
-                    await state.text_channel.send(
-                        embed=discord.Embed(
-                            description=f"⚠️ No se pudo reproducir **{next_track.title}**. Saltando a la siguiente...",
-                            color=discord.Color.red(),
-                        )
+        # Preparar audio local en /tmp (o stream de respaldo si es muy largo)
+        try:
+            next_track = await self.bot.loop.run_in_executor(
+                None, download_track_to_tmp, next_track
+            )
+        except Exception as exc:
+            logger.warning(f"No se pudo cargar '{next_track.title}': {exc}")
+            if state.text_channel:
+                await state.text_channel.send(
+                    embed=discord.Embed(
+                        description=f"⚠️ No se pudo reproducir **{next_track.title}**. Saltando a la siguiente...",
+                        color=discord.Color.red(),
                     )
-                await self.play_next(guild)
-                return
+                )
+            await self.play_next(guild)
+            return
 
         state.register_played(next_track)
 
+        # Usar FFmpegOpusAudio (evita re-codificación PCM en Python y elimina cortes de CPU en la nube)
         try:
-            source = discord.FFmpegPCMAudio(next_track.stream_url, **FFMPEG_OPTIONS)
-            audio_source = discord.PCMVolumeTransformer(source, volume=0.8)
+            if next_track.local_file and os.path.isfile(next_track.local_file):
+                audio_source = await discord.FFmpegOpusAudio.from_probe(
+                    next_track.local_file,
+                    method="fallback",
+                    **FFMPEG_LOCAL_OPTIONS,
+                )
+            elif next_track.stream_url:
+                audio_source = await discord.FFmpegOpusAudio.from_probe(
+                    next_track.stream_url,
+                    method="fallback",
+                    **FFMPEG_STREAM_OPTIONS,
+                )
+            else:
+                raise ValueError("No se encontró fuente de audio reproducible.")
         except Exception as exc:
-            logger.exception("Fallo al inicializar FFmpegPCMAudio:")
+            logger.exception("Fallo al inicializar FFmpegOpusAudio:")
+            cleanup_track_file(next_track)
             if state.text_channel:
                 await state.text_channel.send(
                     embed=discord.Embed(
@@ -647,7 +972,7 @@ class MusicCog(commands.Cog, name="Música"):
 
         def after_playback(play_error: Optional[Exception]) -> None:
             fut = asyncio.run_coroutine_threadsafe(
-                self.play_next(guild, play_error),
+                self.play_next(guild, next_track, play_error),
                 self.bot.loop,
             )
             try:
@@ -656,6 +981,11 @@ class MusicCog(commands.Cog, name="Música"):
                 logger.error(f"Excepción en el callback after_playback: {cb_exc}")
 
         voice_client.play(audio_source, after=after_playback)
+
+        # Iniciar pre-descarga en segundo plano de la siguiente canción de la cola
+        state.cancel_prefetch_task()
+        if state.queue:
+            state.prefetch_task = self.bot.loop.create_task(self._prefetch_next_in_queue(guild))
 
         if state.text_channel:
             if next_track.is_autoplay:
@@ -688,7 +1018,7 @@ class MusicCog(commands.Cog, name="Música"):
     @commands.hybrid_command(
         name="play",
         aliases=["p"],
-        description="Reproduce una canción o playlist completa de YouTube/SoundCloud.",
+        description="Reproduce una canción o playlist completa de YouTube, YouTube Music o SoundCloud.",
     )
     async def play(self, ctx: commands.Context, *, query: str) -> None:
         if not ctx.guild or not isinstance(ctx.author, discord.Member):
@@ -750,6 +1080,9 @@ class MusicCog(commands.Cog, name="Música"):
 
             if not was_playing:
                 await self.play_next(ctx.guild)
+            elif len(state.queue) == len(tracks):
+                state.cancel_prefetch_task()
+                state.prefetch_task = self.bot.loop.create_task(self._prefetch_next_in_queue(ctx.guild))
         else:
             track = tracks[0]
             if was_playing:
@@ -764,6 +1097,10 @@ class MusicCog(commands.Cog, name="Música"):
                 if track.thumbnail:
                     embed.set_thumbnail(url=track.thumbnail)
                 await ctx.send(embed=embed)
+
+                if len(state.queue) == 1:
+                    state.cancel_prefetch_task()
+                    state.prefetch_task = self.bot.loop.create_task(self._prefetch_next_in_queue(ctx.guild))
             else:
                 if ctx.interaction:
                     embed = discord.Embed(
@@ -907,19 +1244,23 @@ class MusicCog(commands.Cog, name="Música"):
         if state.queue:
             upcoming = list(state.queue)[:10]
             lines = [
-                f"`{idx}.` **[{track.title}]({track.webpage_url})** (`{track.formatted_duration}`) — {track.requester.mention}"
-                for idx, track in enumerate(upcoming, start=1)
+                f"`{idx}.` **[{t.title}]({t.webpage_url})** (`{t.formatted_duration}`) — {t.requester.mention}"
+                for idx, t in enumerate(upcoming, start=1)
             ]
+            remaining = len(state.queue) - len(upcoming)
+            if remaining > 0:
+                lines.append(f"\n*...y **{remaining}** canciones más en la cola.*")
+
             embed.add_field(
-                name=f"⏳ Próximas canciones (Mostrando {len(upcoming)} de {len(state.queue)})",
+                name=f"⏳ Próximas canciones ({len(state.queue)} en total)",
                 value="\n".join(lines),
                 inline=False,
             )
         else:
-            autoplay_status = "Activado ✅ (pondrá recomendados al terminar)" if state.autoplay else "Desactivado ⛔"
+            autoplay_label = "Activado ✅" if state.autoplay else "Desactivado ⛔"
             embed.add_field(
                 name="⏳ Próximas canciones",
-                value=f"_No hay más canciones en cola._\n📻 **Autoplay:** {autoplay_status}",
+                value=f"*No hay más canciones en cola. Autoplay: **{autoplay_label}**.*",
                 inline=False,
             )
 
@@ -927,31 +1268,29 @@ class MusicCog(commands.Cog, name="Música"):
 
     @commands.hybrid_command(
         name="stop",
-        description="Limpia la cola y detiene el audio por completo.",
+        description="Detiene la reproducción y limpia toda la cola.",
     )
     async def stop(self, ctx: commands.Context) -> None:
         if not ctx.guild:
             return
         voice_client: Optional[discord.VoiceClient] = ctx.guild.voice_client
         state = self.get_state(ctx.guild.id)
-        state.queue.clear()
-        state.current = None
-        state.last_track = None
 
+        state.clear()
         if voice_client and (voice_client.is_playing() or voice_client.is_paused()):
             voice_client.stop()
 
         await ctx.send(
             embed=discord.Embed(
-                description="⏹️ Se detuvo la reproducción y se limpió la cola.",
-                color=discord.Color.orange(),
+                description="⏹️ Reproducción detenida y cola de canciones vaciada.",
+                color=discord.Color.red(),
             )
         )
 
     @commands.hybrid_command(
         name="leave",
         aliases=["dc"],
-        description="Limpia la cola y desconecta al bot del canal de voz.",
+        description="Desconecta al bot del canal de voz.",
     )
     async def leave(self, ctx: commands.Context) -> None:
         if not ctx.guild:
@@ -972,7 +1311,7 @@ class MusicCog(commands.Cog, name="Música"):
 
         await ctx.send(
             embed=discord.Embed(
-                description="👋 Me desconecté del canal de voz y limpié la cola.",
+                description="👋 Desconectado del canal de voz. ¡Hasta la próxima, compita!",
                 color=discord.Color.blurple(),
             )
         )
@@ -984,14 +1323,14 @@ class MusicCog(commands.Cog, name="Música"):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Desconecta automáticamente al bot si se queda solo en el canal de voz por más de 3 minutos."""
-        voice_client: Optional[discord.VoiceClient] = member.guild.voice_client
+        guild = member.guild
+        voice_client: Optional[discord.VoiceClient] = guild.voice_client
         if not voice_client or not voice_client.channel:
             return
 
-        state = self.get_state(member.guild.id)
+        state = self.get_state(guild.id)
 
-        if self.bot.user and member.id == self.bot.user.id and after.channel is None:
+        if member.id == self.bot.user.id and after.channel is None:
             state.clear()
             return
 
@@ -1000,31 +1339,39 @@ class MusicCog(commands.Cog, name="Música"):
         if len(non_bot_members) == 0:
             if state.inactivity_task is None or state.inactivity_task.done():
                 state.inactivity_task = self.bot.loop.create_task(
-                    self._disconnect_after_inactivity(member.guild)
+                    self._disconnect_after_timeout(guild, voice_client.channel)
                 )
         else:
             state.cancel_inactivity_task()
 
-    async def _disconnect_after_inactivity(self, guild: discord.Guild) -> None:
+    async def _disconnect_after_timeout(
+        self,
+        guild: discord.Guild,
+        channel: discord.abc.Connectable,
+    ) -> None:
         try:
             await asyncio.sleep(180)
             voice_client: Optional[discord.VoiceClient] = guild.voice_client
-            if voice_client and voice_client.is_connected() and voice_client.channel:
-                non_bot_members = [m for m in voice_client.channel.members if not m.bot]
-                if len(non_bot_members) == 0:
-                    state = self.get_state(guild.id)
-                    text_channel = state.text_channel
-                    state.clear()
-                    await voice_client.disconnect()
-                    if text_channel:
-                        await text_channel.send(
-                            embed=discord.Embed(
-                                description="💤 Me desconecté automáticamente tras pasar 3 minutos solo en el canal de voz.",
-                                color=discord.Color.light_grey(),
-                            )
+            if not voice_client or not voice_client.is_connected():
+                return
+
+            non_bot_members = [m for m in voice_client.channel.members if not m.bot]
+            if len(non_bot_members) == 0:
+                state = self.get_state(guild.id)
+                text_channel = state.text_channel
+                state.clear()
+                await voice_client.disconnect()
+                if text_channel:
+                    await text_channel.send(
+                        embed=discord.Embed(
+                            description="🔇 Me desconecté automáticamente tras **3 minutos** de estar solo en el canal de voz.",
+                            color=discord.Color.light_grey(),
                         )
+                    )
         except asyncio.CancelledError:
             pass
+        except Exception as exc:
+            logger.error(f"Error en tarea de desconexión por inactividad: {exc}")
 
 
 class ElCompitaBot(commands.Bot):
@@ -1032,6 +1379,7 @@ class ElCompitaBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
+        intents.guilds = True
 
         super().__init__(
             command_prefix="!",
@@ -1040,13 +1388,13 @@ class ElCompitaBot(commands.Bot):
         )
 
     async def setup_hook(self) -> None:
-        await self.add_cog(MusicCog(self))
         self.loop.create_task(start_healthcheck_server())
+        await self.add_cog(MusicCog(self))
         try:
             synced = await self.tree.sync()
             logger.info(f"Se sincronizaron {len(synced)} comandos híbridos/slash.")
         except Exception as exc:
-            logger.warning(f"No se pudieron sincronizar los comandos slash: {exc}")
+            logger.warning(f"No se pudieron sincronizar los slash commands globalmente: {exc}")
 
     async def on_ready(self) -> None:
         if self.user:
@@ -1054,28 +1402,22 @@ class ElCompitaBot(commands.Bot):
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.listening,
-                name="!play | Playlists & Autoplay",
+                name="!play | Música + Autoplay",
             )
         )
 
     async def on_command_error(
         self, ctx: commands.Context, error: commands.CommandError
     ) -> None:
-        """Manejo global de errores de comandos."""
         if isinstance(error, commands.CommandNotFound):
             return
-
         if isinstance(error, commands.MissingRequiredArgument):
             await ctx.send(
                 embed=discord.Embed(
-                    description=f"⚠️ Falta el argumento requerido: `{error.param.name}`.\nUso: `!{ctx.command.qualified_name} {ctx.command.signature}`",
-                    color=discord.Color.gold(),
+                    description=f"⚠️ Falta un argumento requerido: `{error.param.name}`.\nEjemplo: `!play <nombre o URL de canción/playlist>`",
+                    color=discord.Color.orange(),
                 )
             )
-            return
-
-        if isinstance(error, commands.NoPrivateMessage):
-            await ctx.send("❌ Este comando solo puede utilizarse dentro de un servidor.")
             return
 
         original = getattr(error, "original", error)
@@ -1115,10 +1457,10 @@ async def _handle_http_client(
 
 
 async def start_healthcheck_server() -> None:
-    """Mini servidor HTTP para poder usar el Plan Gratis ($0) de Render.com."""
+    """Mini servidor HTTP con auto-ping cada 10 min para mantener activo Render Free 24/7."""
     port = int(os.getenv("PORT", "8080"))
     try:
-        server = await asyncio.start_server(_handle_http_client, "0.0.0.0", port)
+        await asyncio.start_server(_handle_http_client, "0.0.0.0", port)
         logger.info(f"🌐 Servidor Health-Check escuchando en el puerto {port} (compatible con Render Free).")
     except Exception as exc:
         logger.warning(f"No se pudo iniciar el servidor health-check en el puerto {port}: {exc}")
