@@ -2130,8 +2130,9 @@ class ElCompitaBot(commands.Bot):
         ensure_opus_loaded()
         try:
             import davey  # type: ignore
+            from importlib.metadata import version as _pkg_version
 
-            davey_ver = getattr(davey, "__version__", "instalado")
+            davey_ver = getattr(davey, "__version__", None) or _pkg_version("davey")
         except Exception:
             davey_ver = "NO instalado"
         logger.info(

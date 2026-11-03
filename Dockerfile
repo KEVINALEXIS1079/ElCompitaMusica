@@ -34,7 +34,7 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip && \
     (pip install --no-cache-dir -U -r requirements.txt || \
-     pip install --no-cache-dir -U "discord.py[voice]>=2.7.1" "davey>=0.1.0" "yt-dlp[default]" "python-dotenv>=1.0.1" "PyNaCl>=1.5.0") && \
+     pip install --no-cache-dir -U "discord.py[voice]>=2.7.1" "davey>=0.1.7,<0.2.0" "yt-dlp[default]" "python-dotenv>=1.0.1" "PyNaCl>=1.5.0") && \
     (pip install --no-cache-dir -U bgutil-ytdlp-pot-provider || true)
 
 COPY main.py cookies.enc ./

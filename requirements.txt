@@ -1,5 +1,5 @@
 discord.py[voice]>=2.7.1
-davey>=0.1.0
+davey>=0.1.7,<0.2.0
 yt-dlp[default,curl-cffi]>=2025.1.15
 bgutil-ytdlp-pot-provider
 python-dotenv>=1.0.1
