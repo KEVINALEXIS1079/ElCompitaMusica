@@ -32,7 +32,7 @@ import yt_dlp
 # CONFIGURACIÓN DE LOGGING Y VARIABLES DE ENTORNO
 # ==============================================================================
 
-RECENT_LOGS: Deque[str] = deque(maxlen=250)
+RECENT_LOGS: Deque[str] = deque(maxlen=400)
 
 
 class MemoryRingLogHandler(logging.Handler):
@@ -55,6 +55,8 @@ logging.basicConfig(
 ring_handler = MemoryRingLogHandler()
 ring_handler.setFormatter(log_fmt)
 logging.getLogger().addHandler(ring_handler)
+for _vlogger in ("discord.voice_state", "discord.voice_client", "discord.player"):
+    logging.getLogger(_vlogger).setLevel(logging.DEBUG)
 
 logger = logging.getLogger("ElCompitaMusica")
 
@@ -81,12 +83,18 @@ def start_bgutil_pot_server() -> None:
         return
     try:
         BGUTIL_PROCESS = subprocess.Popen(
-            ["node", server_script, "--port", "4416", "--host", "127.0.0.1"],
+            ["node", server_script, "--port", "4416"],
             cwd="/opt/bgutil/server",
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
         )
-        for _ in range(30):
+        for _ in range(35):
+            if BGUTIL_PROCESS.poll() is not None:
+                out = ""
+                if BGUTIL_PROCESS.stdout:
+                    out = BGUTIL_PROCESS.stdout.read().decode("utf-8", errors="ignore").strip()
+                logger.warning(f"⚠️ Servidor POT bgutil terminó prematuramente: {out[:300]}")
+                return
             time.sleep(0.1)
             try:
                 with socket.create_connection(("127.0.0.1", 4416), timeout=0.2):
@@ -293,6 +301,43 @@ FFMPEG_STREAM_OPTIONS = {
 # ==============================================================================
 
 class ResilientVoiceConnectionState(VoiceConnectionState):
+    def __init__(self, voice_client: discord.VoiceClient, *, hook: Optional[Any] = None) -> None:
+        self._last_external_sender: Optional[bytes] = None
+        super().__init__(voice_client, hook=hook)
+
+    async def reinit_dave_session(self) -> None:
+        await super().reinit_dave_session()
+        if self.dave_session is not None and self._last_external_sender is not None:
+            try:
+                self.dave_session.set_external_sender(self._last_external_sender)
+            except Exception:
+                pass
+        logger.info(
+            f"🔐 DAVE reinit: ver={self.dave_protocol_version} "
+            f"session={self.dave_session is not None} "
+            f"ready={getattr(self.dave_session, 'ready', None)}"
+        )
+
+    async def _connect_websocket(self, resume: bool) -> DiscordVoiceWebSocket:
+        ws = await super()._connect_websocket(resume)
+        orig_bin = ws.received_binary_message
+
+        async def _wrapped_binary(msg: bytes) -> None:
+            op = msg[2] if len(msg) > 2 else -1
+            if op == DiscordVoiceWebSocket.MLS_EXTERNAL_SENDER and len(msg) > 3:
+                self._last_external_sender = msg[3:]
+            try:
+                await orig_bin(msg)
+                rdy = getattr(self.dave_session, "ready", None) if self.dave_session else None
+                logger.info(
+                    f"🔑 Voice WS Binary op={op} len={len(msg)}B | dave_ready={rdy} can_encrypt={self.can_encrypt}"
+                )
+            except Exception as exc:
+                logger.exception(f"❌ Error procesando frame binario DAVE op={op}: {exc}")
+
+        ws.received_binary_message = _wrapped_binary  # type: ignore
+        return ws
+
     async def voice_server_update(self, data: Any) -> None:
         was_connected = self.state is ConnectionFlowState.connected
         if was_connected:
@@ -307,11 +352,29 @@ class ResilientVoiceConnectionState(VoiceConnectionState):
 
 
 class ResilientVoiceClient(discord.VoiceClient):
+    def __init__(self, client: discord.Client, channel: discord.abc.Connectable) -> None:
+        self._pkt_count: int = 0
+        self._drop_count: int = 0
+        super().__init__(client, channel)
+
     def create_connection_state(self) -> VoiceConnectionState:
         async def _on_voice_ws_msg(ws: DiscordVoiceWebSocket, msg: Dict[str, Any]) -> None:
-            # En discord.py 2.7.1, load_secret_key (op 4 SESSION_DESCRIPTION) envía speak(False).
-            # Si el reproductor ya está activo tras una reconexión o cambio de canal, reactivar speak(voice).
-            if msg.get("op") == DiscordVoiceWebSocket.SESSION_DESCRIPTION:
+            op = msg.get("op")
+            if op in (
+                DiscordVoiceWebSocket.READY,
+                DiscordVoiceWebSocket.SESSION_DESCRIPTION,
+                DiscordVoiceWebSocket.SPEAKING,
+                DiscordVoiceWebSocket.DAVE_PREPARE_TRANSITION,
+                DiscordVoiceWebSocket.DAVE_EXECUTE_TRANSITION,
+                DiscordVoiceWebSocket.DAVE_PREPARE_EPOCH,
+                11,
+                12,
+                13,
+            ):
+                rdy = getattr(self._connection.dave_session, "ready", None) if self._connection.dave_session else None
+                logger.info(f"📨 Voice WS JSON op={op} | dave_v={self._connection.dave_protocol_version} ready={rdy}")
+
+            if op == DiscordVoiceWebSocket.SESSION_DESCRIPTION:
                 if self.is_playing() and not self.is_paused():
                     try:
                         await ws.speak(SpeakingState.voice)
@@ -320,6 +383,30 @@ class ResilientVoiceClient(discord.VoiceClient):
                         logger.debug(f"No se pudo restaurar speaking(voice): {exc}")
 
         return ResilientVoiceConnectionState(self, hook=_on_voice_ws_msg)
+
+    def send_audio_packet(self, data: bytes, *, encode: bool = True) -> None:
+        self._pkt_count += 1
+        self.checked_add("sequence", 1, 65535)
+        if encode:
+            encoded_data = self.encoder.encode(data, self.encoder.SAMPLES_PER_FRAME)
+        else:
+            encoded_data = data
+        packet = self._get_voice_packet(encoded_data)
+        try:
+            self._connection.send_packet(packet)
+            if self._pkt_count in (1, 50, 150, 400) or self._pkt_count % 1000 == 0:
+                conn = self._connection
+                dave_rdy = getattr(conn.dave_session, "ready", None) if conn.dave_session else None
+                logger.info(
+                    f"📡 RTP #{self._pkt_count}: seq={self.sequence} pcm={len(data)}B opus={len(encoded_data)}B "
+                    f"pkt={len(packet)}B mode={self.mode} dave_v={conn.dave_protocol_version} "
+                    f"dave_ready={dave_rdy} can_enc={conn.can_encrypt}"
+                )
+        except OSError as exc:
+            self._drop_count += 1
+            if self._drop_count <= 5 or self._drop_count % 100 == 0:
+                logger.warning(f"⚠️ UDP packet dropped (#{self._drop_count}, seq={self.sequence}): {exc}")
+        self.checked_add("timestamp", discord.opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
 
 
 # ==============================================================================
@@ -519,7 +606,7 @@ def fetch_youtube_oembed_metadata(url: str) -> Optional[Dict[str, Any]]:
 
         vid_id = extract_youtube_video_id(clean_url) or ""
         full_title = title
-        if author and author.lower() not in title.lower():
+        if author and author.lower() not in title.lower() and " - " not in title and " – " not in title:
             full_title = f"{author} - {title}"
 
         return {
@@ -568,7 +655,7 @@ def fetch_youtube_flat_search(query: str) -> Optional[Dict[str, Any]]:
                 continue
             channel = (entry.get("channel") or entry.get("uploader") or "").replace(" - Topic", "").strip()
             full_title = title
-            if channel and channel.lower() not in title.lower():
+            if channel and channel.lower() not in title.lower() and " - " not in title and " – " not in title:
                 full_title = f"{channel} - {title}"
             thumbnails = entry.get("thumbnails") or []
             thumb = entry.get("thumbnail") or (thumbnails[-1].get("url") if thumbnails else None)
@@ -1589,8 +1676,15 @@ class MusicCog(commands.Cog, name="Música"):
                             timeout=15.0,
                             reconnect=True,
                             cls=ResilientVoiceClient,
-                            self_deaf=True,
+                            self_deaf=False,
+                            self_mute=False,
                         )
+                        # Dar hasta 2.0s al event loop para completar el handshake MLS DAVE E2EE antes de transmitir RTP
+                        for _ in range(20):
+                            conn = getattr(voice_client, "_connection", None)
+                            if conn and (conn.dave_protocol_version == 0 or conn.can_encrypt):
+                                break
+                            await asyncio.sleep(0.1)
                     except Exception as exc:
                         logger.error(f"No se pudo conectar al canal de voz: {exc}")
                         cleanup_track_file(next_track)
@@ -1600,6 +1694,11 @@ class MusicCog(commands.Cog, name="Música"):
                     return
             elif target_voice_channel is not None and voice_client.channel != target_voice_channel:
                 await voice_client.move_to(target_voice_channel)
+                for _ in range(15):
+                    conn = getattr(voice_client, "_connection", None)
+                    if conn and (conn.dave_protocol_version == 0 or conn.can_encrypt):
+                        break
+                    await asyncio.sleep(0.1)
 
             state.register_played(next_track)
             ensure_opus_loaded()
