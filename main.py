@@ -922,12 +922,12 @@ def _try_direct_youtube_info(target_query: str) -> Optional[Dict[str, Any]]:
     has_cookies = bool(get_fresh_cookie_file())
     if has_cookies:
         profiles = [
-            {"use_cookies": True, "player_clients": ["mweb", "tv", "web_safari", "default"]},
-            {"use_cookies": False, "player_clients": ["mweb", "tv", "web_safari", "default"]},
+            {"use_cookies": True, "player_clients": ["web_creator", "web", "mweb", "web_safari"]},
+            {"use_cookies": False, "player_clients": ["mweb", "web_safari", "ios", "tv"]},
         ]
     else:
         profiles = [
-            {"use_cookies": False, "player_clients": ["mweb", "tv", "web_safari", "default"]},
+            {"use_cookies": False, "player_clients": ["mweb", "web_safari", "ios", "tv"]},
         ]
     for prof in profiles:
         opts = build_ytdl_options(
@@ -1152,11 +1152,11 @@ def download_track_to_tmp(track: Track) -> Track:
         has_cookies = bool(get_fresh_cookie_file())
         yt_profiles = (
             (
-                (True, ["mweb", "tv", "web_safari", "default"]),
-                (False, ["mweb", "tv", "web_safari", "default"]),
+                (True, ["web_creator", "web", "mweb", "web_safari"]),
+                (False, ["mweb", "web_safari", "ios", "tv"]),
             )
             if has_cookies
-            else ((False, ["mweb", "tv", "web_safari", "default"]),)
+            else ((False, ["mweb", "web_safari", "ios", "tv"]),)
         )
         for use_cookies, clients in yt_profiles:
             yt_opts = build_ytdl_options(
@@ -1273,32 +1273,7 @@ def extract_tracks(query: str, requester: discord.abc.User) -> List[Track]:
         if normalized_query.startswith(("http://", "https://")) and "soundcloud.com" in normalized_query:
             return [_resolve_soundcloud_stream(normalized_query, requester, user_query=query)]
 
-        # 1. Intentar extracción directa de YouTube (con POT provider)
-        target_for_yt = (
-            normalized_query
-            if normalized_query.startswith(("http://", "https://"))
-            else f"ytsearch1:{normalized_query}"
-        )
-        info = _try_direct_youtube_info(target_for_yt)
-        if info:
-            vid_id = str(info.get("id") or extract_youtube_video_id(normalized_query) or "")
-            webpage = (
-                info.get("webpage_url")
-                or (f"https://www.youtube.com/watch?v={vid_id}" if len(vid_id) == 11 else normalized_query)
-            )
-            return [
-                Track(
-                    title=info.get("title", "Título desconocido"),
-                    webpage_url=webpage,
-                    stream_url=info.get("url"),
-                    video_id=vid_id,
-                    duration=info.get("duration"),
-                    thumbnail=info.get("thumbnail"),
-                    requester=requester,
-                )
-            ]
-
-        # 2. Obtener metadatos oficiales exactos de YouTube (video_id, título, duración, miniatura)
+        # 1. Obtener metadatos oficiales exactos de YouTube en <0.5s (sin triplicar descargas antes de download_track_to_tmp)
         yt_meta: Optional[Dict[str, Any]] = None
         if normalized_query.startswith(("http://", "https://")) and (
             "youtube.com" in normalized_query or "youtu.be" in normalized_query
@@ -1319,6 +1294,31 @@ def extract_tracks(query: str, requester: discord.abc.User) -> List[Track]:
                     video_id=str(yt_meta["video_id"]),
                     duration=yt_meta.get("duration"),
                     thumbnail=yt_meta.get("thumbnail"),
+                    requester=requester,
+                )
+            ]
+
+        # 2. Si flat search no devolvió video_id, intentar extracción directa de YouTube
+        target_for_yt = (
+            normalized_query
+            if normalized_query.startswith(("http://", "https://"))
+            else f"ytsearch1:{normalized_query}"
+        )
+        info = _try_direct_youtube_info(target_for_yt)
+        if info:
+            vid_id = str(info.get("id") or extract_youtube_video_id(normalized_query) or "")
+            webpage = (
+                info.get("webpage_url")
+                or (f"https://www.youtube.com/watch?v={vid_id}" if len(vid_id) == 11 else normalized_query)
+            )
+            return [
+                Track(
+                    title=info.get("title", "Título desconocido"),
+                    webpage_url=webpage,
+                    stream_url=info.get("url"),
+                    video_id=vid_id,
+                    duration=info.get("duration"),
+                    thumbnail=info.get("thumbnail"),
                     requester=requester,
                 )
             ]
