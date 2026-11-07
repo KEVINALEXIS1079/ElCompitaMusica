@@ -1,4 +1,6 @@
-FROM python:3.11-slim
+FROM brainicism/bgutil-ytdlp-pot-provider:latest AS bgutil
+
+FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
@@ -8,26 +10,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libopus0 \
     libopus-dev \
-    nodejs \
-    npm \
-    git \
-    pkg-config \
-    libcairo2-dev \
-    libpango1.0-dev \
-    libjpeg-dev \
-    libgif-dev \
-    librsvg2-dev \
+    libcairo2 \
+    libpango-1.0-0 \
+    libpangocairo-1.0-0 \
+    libjpeg62-turbo \
+    libgif7 \
+    librsvg2-2 \
     libffi-dev \
     libnacl-dev \
-    python3-dev \
-    build-essential \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
-RUN (git clone --depth 1 https://github.com/Brainicism/bgutil-ytdlp-pot-provider.git /opt/bgutil && \
-     cd /opt/bgutil/server && \
-     npm install && \
-     ./node_modules/.bin/tsc) || true
+COPY --from=bgutil /usr/local/bin/node /usr/local/bin/node
+COPY --from=bgutil /app /opt/bgutil/server
 
 WORKDIR /app
 

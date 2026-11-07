@@ -164,12 +164,33 @@ def _decrypt_cookies_enc(enc_path: str, secret: str) -> Optional[str]:
         return None
 
 
+def _encrypt_cookies_enc(plaintext: str, secret: str, enc_path: str = "cookies.enc") -> None:
+    """Encripta el contenido de cookies.txt en cookies.enc usando DISCORD_TOKEN."""
+    salt = os.urandom(16)
+    key = hashlib.pbkdf2_hmac("sha256", secret.encode("utf-8"), salt, 100_000, dklen=32)
+    pt_bytes = plaintext.encode("utf-8")
+    ciphertext = bytearray()
+    for idx in range(0, len(pt_bytes), 32):
+        block = hashlib.sha256(key + idx.to_bytes(8, "big")).digest()
+        chunk = pt_bytes[idx : idx + 32]
+        ciphertext.extend(a ^ b for a, b in zip(chunk, block))
+    mac = hmac.new(key, salt + bytes(ciphertext), hashlib.sha256).digest()
+    encoded = base64.b64encode(salt + mac + bytes(ciphertext)).decode("ascii")
+    with open(enc_path, "w", encoding="utf-8") as f:
+        f.write(encoded)
+
+
 def prepare_cookies_file() -> Optional[str]:
     """Prepara un archivo maestro de cookies para YouTube sin permitir que yt-dlp lo sobreescriba."""
     if os.path.isfile("cookies.txt") and os.path.getsize("cookies.txt") > 0:
         try:
             shutil.copyfile("cookies.txt", COOKIES_MASTER_FILE)
             shutil.copyfile(COOKIES_MASTER_FILE, COOKIES_WORKING_FILE)
+            if DISCORD_TOKEN:
+                with open("cookies.txt", "r", encoding="utf-8", errors="ignore") as cf:
+                    raw_cookies = cf.read().strip()
+                if ".youtube.com" in raw_cookies:
+                    _encrypt_cookies_enc(raw_cookies + "\n", DISCORD_TOKEN, "cookies.enc")
             logger.info("✅ Cookies de YouTube cargadas desde ./cookies.txt")
             return COOKIES_WORKING_FILE
         except Exception as exc:
@@ -208,7 +229,12 @@ ACTIVE_COOKIES_FILE = prepare_cookies_file()
 
 
 def get_fresh_cookie_file() -> Optional[str]:
-    """Devuelve una copia fresca del archivo de cookies para que yt-dlp no lo corrompa."""
+    """
+    Devuelve el archivo de trabajo de cookies conservando las cookies rotadas por YouTube/yt-dlp.
+    Solo restaura desde el archivo maestro si el archivo de trabajo no existe o quedó vacío.
+    """
+    if os.path.isfile(COOKIES_WORKING_FILE) and os.path.getsize(COOKIES_WORKING_FILE) > 100:
+        return COOKIES_WORKING_FILE
     if os.path.isfile(COOKIES_MASTER_FILE) and os.path.getsize(COOKIES_MASTER_FILE) > 0:
         try:
             shutil.copyfile(COOKIES_MASTER_FILE, COOKIES_WORKING_FILE)
@@ -446,6 +472,18 @@ BANNED_VARIANT_KEYWORDS = (
     "flip",
     "bass boosted",
     "earrape",
+    "live",
+    "en vivo",
+    "concierto",
+    "acoustic",
+    "acústico",
+    "unplugged",
+    "demo",
+    "freestyle",
+    "radio edit",
+    "extended mix",
+    "club mix",
+    "vip mix",
 )
 
 
@@ -623,27 +661,68 @@ def fetch_youtube_oembed_metadata(url: str) -> Optional[Dict[str, Any]]:
         return None
 
 
+def _score_search_entry(entry: Dict[str, Any], query: str, expected_duration: Optional[int] = None) -> float:
+    """Puntúa un resultado de búsqueda priorizando canales oficiales, alta popularidad y coincidencia de título."""
+    title = (entry.get("title") or "").lower()
+    channel = (entry.get("channel") or entry.get("uploader") or "").lower()
+    views = int(entry.get("view_count") or entry.get("playback_count") or 0)
+    dur = entry.get("duration")
+
+    score = 0.0
+    if views > 0:
+        import math
+        score += min(math.log10(views + 1) * 12.0, 90.0)
+
+    if "- topic" in channel or "vevo" in channel or "official" in channel or "oficial" in channel:
+        score += 35.0
+    if "official" in title or "oficial" in title or "audio" in title or "music video" in title:
+        score += 15.0
+
+    q_words = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2]
+    if q_words:
+        matched = sum(1 for w in q_words if w in title or w in channel)
+        score += (matched / len(q_words)) * 40.0
+
+    # Penalizar feat./ft. adicionales que no estaban en la búsqueda original
+    if ("feat." in title or "ft." in title or "featuring" in title) and not (
+        "feat" in query.lower() or "ft." in query.lower()
+    ):
+        score -= 35.0
+
+    if expected_duration and dur:
+        diff = abs(int(dur) - int(expected_duration))
+        if diff <= 5:
+            score += 30.0
+        elif diff <= 15:
+            score += 15.0
+        else:
+            score -= min(diff, 60)
+
+    return score
+
+
 def fetch_youtube_flat_search(query: str) -> Optional[Dict[str, Any]]:
     """
     Busca en YouTube con extract_flat=True (que NO reproduce el video ni sufre bloqueo de bot)
-    para obtener el video_id, título, duración y carátula oficial de YouTube en <0.8s.
+    para obtener el video_id, título, duración y carátula oficial de YouTube en <0.8s,
+    eligiendo la versión oficial más popular.
     """
     try:
         opts = build_ytdl_options(
             allow_playlist=False,
             flat_playlist=True,
-            playlist_end=5,
+            playlist_end=8,
             default_search="ytsearch",
             use_cookies=False,
         )
         opts["extract_flat"] = True
-        search_target = query if query.startswith(("http://", "https://")) else f"ytsearch5:{query}"
+        search_target = query if query.startswith(("http://", "https://")) else f"ytsearch8:{query}"
         with yt_dlp.YoutubeDL(opts) as ytdl:
             info = ytdl.extract_info(search_target, download=False)
-        entries = (info or {}).get("entries") or ([info] if info and info.get("id") else [])
+        entries = [e for e in ((info or {}).get("entries") or ([info] if info and info.get("id") else [])) if e]
+        if not query.startswith(("http://", "https://")):
+            entries.sort(key=lambda e: _score_search_entry(e, query), reverse=True)
         for entry in entries:
-            if not entry:
-                continue
             vid_id = entry.get("id")
             title = entry.get("title")
             duration = entry.get("duration")
@@ -837,13 +916,19 @@ class GuildMusicState:
 def _try_direct_youtube_info(target_query: str) -> Optional[Dict[str, Any]]:
     """
     Intenta extraer el stream directo oficial de YouTube probando:
-    1) Con proveedor POT (bgutil) sin cookies (evita rechazos por cookies rotadas de otra IP).
-    2) Con proveedor POT (bgutil) + cookies.
+    1) Con proveedor POT (bgutil) + cookies (si existen).
+    2) Con proveedor POT (bgutil) sin cookies.
     """
-    profiles = [
-        {"use_cookies": False, "player_clients": ["default", "mweb", "tv"]},
-        {"use_cookies": True, "player_clients": ["default", "tv", "web"]},
-    ]
+    has_cookies = bool(get_fresh_cookie_file())
+    if has_cookies:
+        profiles = [
+            {"use_cookies": True, "player_clients": ["mweb", "tv", "web_safari", "default"]},
+            {"use_cookies": False, "player_clients": ["mweb", "tv", "web_safari", "default"]},
+        ]
+    else:
+        profiles = [
+            {"use_cookies": False, "player_clients": ["mweb", "tv", "web_safari", "default"]},
+        ]
     for prof in profiles:
         opts = build_ytdl_options(
             allow_playlist=False,
@@ -945,6 +1030,7 @@ def _resolve_soundcloud_stream(
         for_soundcloud=True,
     )
     expected_dur = yt_meta.get("duration") if yt_meta else None
+    entries.sort(key=lambda e: _score_search_entry(e, clean_query, expected_dur), reverse=True)
 
     # Dos pasadas: 1) Coincidencia estricta de duración (±28s) y sin palabras prohibidas.
     #              2) Sin palabras prohibidas ni previews (<45s).
@@ -1063,10 +1149,16 @@ def download_track_to_tmp(track: Track) -> Track:
         else:
             yt_target = normalize_youtube_url(yt_target, playlist_mode=False)
 
-        for use_cookies, clients in (
-            (False, ["default", "mweb", "tv"]),
-            (True, ["default", "tv", "web"]),
-        ):
+        has_cookies = bool(get_fresh_cookie_file())
+        yt_profiles = (
+            (
+                (True, ["mweb", "tv", "web_safari", "default"]),
+                (False, ["mweb", "tv", "web_safari", "default"]),
+            )
+            if has_cookies
+            else ((False, ["mweb", "tv", "web_safari", "default"]),)
+        )
+        for use_cookies, clients in yt_profiles:
             yt_opts = build_ytdl_options(
                 allow_playlist=False,
                 flat_playlist=False,
