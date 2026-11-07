@@ -514,7 +514,7 @@ def is_unwanted_audio_variant(
         if dur > 900 and (not expected_duration or int(expected_duration) < 600):
             return True
         if strict_duration and expected_duration and int(expected_duration) >= 45:
-            if abs(dur - int(expected_duration)) > 28:
+            if abs(dur - int(expected_duration)) > 16:
                 return True
 
     return False
@@ -754,6 +754,291 @@ def fetch_youtube_flat_search(query: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _clean_music_query(raw_text: str) -> str:
+    """Limpia etiquetas de video de YouTube para dejar únicamente 'Artista - Canción'."""
+    cleaned = (raw_text or "").strip()
+    for noise in (
+        "(Official Video)",
+        "(Video Oficial)",
+        "[Official Video]",
+        "[Video Oficial]",
+        "(Official Music Video)",
+        "[Official Music Video]",
+        "(Official Audio)",
+        "[Official Audio]",
+        "(Audio Oficial)",
+        "(Official Lyric Video)",
+        "[Official Lyric Video]",
+        "(Lyric Video)",
+        "(Lyrics)",
+        "[Lyrics]",
+        "(Letra)",
+        "(Visualizer)",
+        "[Visualizer]",
+        "(HD)",
+        "[HD]",
+        "(4K)",
+        "[4K]",
+        "(HQ)",
+        " - Topic",
+    ):
+        cleaned = re.sub(re.escape(noise), "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" -–|")
+    return cleaned
+
+
+def fetch_studio_master_stream(
+    search_text: str,
+    *,
+    user_query: str = "",
+    expected_duration: Optional[int] = None,
+) -> Optional[Dict[str, Any]]:
+    """
+    Obtiene el audio original de estudio (320kbps AAC / FLAC sin DRM ni remixes de usuarios)
+    consultando el catálogo oficial de Tidal (vía Monochrome / hifi-api) y JioSaavn.
+    """
+    clean_query = _clean_music_query(search_text)
+    if not clean_query:
+        return None
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+        "Accept": "application/json",
+    }
+
+    q_words = [w for w in re.findall(r"\w+", clean_query.lower()) if len(w) > 2]
+
+    # 1. Catálogo oficial de estudio vía Monochrome / hifi-api (Tidal)
+    hifi_hosts = [
+        "https://api.monochrome.tf",
+        "https://triton.squid.wtf",
+        "https://wolf.qqdl.site",
+        "https://maus.qqdl.site",
+        "https://vogel.qqdl.site",
+        "https://katze.qqdl.site",
+        "https://hund.qqdl.site",
+        "https://monochrome-api.samidy.com",
+    ]
+    for host in hifi_hosts:
+        try:
+            search_url = f"{host}/search/?s={quote(clean_query)}"
+            req = urllib.request.Request(search_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                raw_json = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+            items: List[Dict[str, Any]] = []
+            if isinstance(raw_json, dict):
+                data_node = raw_json.get("data")
+                if isinstance(data_node, dict):
+                    items = (
+                        data_node.get("items")
+                        or (data_node.get("tracks") or {}).get("items")
+                        or []
+                    )
+                elif isinstance(data_node, list):
+                    items = data_node
+                if not items:
+                    items = (
+                        raw_json.get("items")
+                        or (raw_json.get("tracks") or {}).get("items")
+                        or []
+                    )
+
+            if not items:
+                continue
+
+            scored_candidates = []
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                track_id = item.get("id")
+                title = str(item.get("title") or "").strip()
+                if not track_id or not title:
+                    continue
+                version = str(item.get("version") or "").strip()
+                full_item_title = f"{title} ({version})" if version else title
+
+                artist_name = ""
+                if isinstance(item.get("artist"), dict):
+                    artist_name = str(item["artist"].get("name") or "").strip()
+                elif isinstance(item.get("artists"), list) and item["artists"]:
+                    first_art = item["artists"][0]
+                    if isinstance(first_art, dict):
+                        artist_name = str(first_art.get("name") or "").strip()
+
+                cand_label = f"{artist_name} - {full_item_title}".strip(" -")
+                cand_dur = item.get("duration")
+
+                if is_unwanted_audio_variant(
+                    cand_label,
+                    user_query=user_query or clean_query,
+                    expected_duration=expected_duration,
+                    candidate_duration=cand_dur,
+                    strict_duration=bool(expected_duration),
+                ):
+                    continue
+
+                if q_words:
+                    cand_low = cand_label.lower()
+                    matched = sum(1 for w in q_words if w in cand_low)
+                    if matched == 0:
+                        continue
+
+                fake_entry = {
+                    "title": cand_label,
+                    "channel": artist_name + " - Topic",
+                    "duration": cand_dur,
+                    "view_count": int(item.get("popularity") or 50) * 100_000,
+                }
+                score = _score_search_entry(fake_entry, clean_query, expected_duration)
+                if not version:
+                    score += 20.0
+                scored_candidates.append((score, track_id, cand_label, cand_dur))
+
+            scored_candidates.sort(key=lambda x: x[0], reverse=True)
+
+            for _, track_id, cand_label, cand_dur in scored_candidates[:3]:
+                for quality in ("HIGH", "LOSSLESS"):
+                    try:
+                        trk_url = f"{host}/track/?id={track_id}&quality={quality}"
+                        t_req = urllib.request.Request(trk_url, headers=headers)
+                        with urllib.request.urlopen(t_req, timeout=5) as t_resp:
+                            t_json = json.loads(t_resp.read().decode("utf-8", errors="ignore"))
+
+                        nodes = []
+                        if isinstance(t_json, list):
+                            nodes.extend(t_json)
+                        elif isinstance(t_json, dict):
+                            if isinstance(t_json.get("data"), list):
+                                nodes.extend(t_json["data"])
+                            elif isinstance(t_json.get("data"), dict):
+                                nodes.append(t_json["data"])
+                            nodes.append(t_json)
+
+                        stream_url = None
+                        for node in nodes:
+                            if not isinstance(node, dict):
+                                continue
+                            if node.get("OriginalTrackUrl") or node.get("url"):
+                                stream_url = node.get("OriginalTrackUrl") or node.get("url")
+                                break
+                            manifest_b64 = node.get("manifest")
+                            if manifest_b64 and isinstance(manifest_b64, str):
+                                try:
+                                    padded = manifest_b64 + "=" * (-len(manifest_b64) % 4)
+                                    m_raw = base64.b64decode(padded).decode("utf-8", errors="ignore")
+                                    if m_raw.strip().startswith("{"):
+                                        m_json = json.loads(m_raw)
+                                        urls = m_json.get("urls") or []
+                                        if urls and isinstance(urls, list):
+                                            stream_url = urls[0]
+                                            break
+                                except Exception:
+                                    pass
+
+                        if stream_url and str(stream_url).startswith("http"):
+                            ext = "flac" if quality == "LOSSLESS" else "m4a"
+                            logger.info(
+                                f"✅ Audio de estudio oficial obtenido vía HiFi ({host}, {quality}): {cand_label} ({cand_dur}s)"
+                            )
+                            return {
+                                "url": str(stream_url),
+                                "title": cand_label,
+                                "duration": cand_dur,
+                                "ext": ext,
+                            }
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+
+    # 2. Catálogo oficial de estudio vía JioSaavn API (320kbps AAC oficial sin DRM)
+    saavn_hosts = [
+        "https://saavn.dev/api/search/songs",
+        "https://jiosaavn-api-privatecvc2.vercel.app/search/songs",
+    ]
+    for s_host in saavn_hosts:
+        try:
+            s_url = f"{s_host}?query={quote(clean_query)}&limit=10"
+            req = urllib.request.Request(s_url, headers=headers)
+            with urllib.request.urlopen(req, timeout=5) as resp:
+                s_json = json.loads(resp.read().decode("utf-8", errors="ignore"))
+
+            results = (
+                ((s_json.get("data") or {}).get("results") if isinstance(s_json.get("data"), dict) else None)
+                or s_json.get("results")
+                or []
+            )
+            scored_saavn = []
+            for song in results:
+                if not isinstance(song, dict):
+                    continue
+                s_name = str(song.get("name") or song.get("title") or "").replace("&quot;", '"').replace("&#039;", "'").strip()
+                if not s_name:
+                    continue
+                artists_str = str(song.get("primaryArtists") or "").strip()
+                if not artists_str and isinstance(song.get("artists"), dict):
+                    prim = song["artists"].get("primary") or []
+                    artists_str = ", ".join(
+                        str(a.get("name") or "").strip() for a in prim if isinstance(a, dict) and a.get("name")
+                    )
+                cand_label = f"{artists_str} - {s_name}".strip(" -")
+                cand_dur = int(song.get("duration") or 0) or None
+
+                if is_unwanted_audio_variant(
+                    cand_label,
+                    user_query=user_query or clean_query,
+                    expected_duration=expected_duration,
+                    candidate_duration=cand_dur,
+                    strict_duration=bool(expected_duration),
+                ):
+                    continue
+
+                if q_words:
+                    cand_low = cand_label.lower()
+                    matched = sum(1 for w in q_words if w in cand_low)
+                    if matched < max(1, len(q_words) // 2):
+                        continue
+
+                dl_list = song.get("downloadUrl") or song.get("download_url") or []
+                best_dl = None
+                if isinstance(dl_list, list) and dl_list:
+                    for item in reversed(dl_list):
+                        if isinstance(item, dict):
+                            u = item.get("url") or item.get("link")
+                            if u and str(u).startswith("http"):
+                                best_dl = str(u)
+                                break
+                if not best_dl:
+                    continue
+
+                fake_entry = {
+                    "title": cand_label,
+                    "channel": artists_str + " - Topic",
+                    "duration": cand_dur,
+                    "view_count": int(song.get("playCount") or 100_000),
+                }
+                score = _score_search_entry(fake_entry, clean_query, expected_duration)
+                scored_saavn.append((score, best_dl, cand_label, cand_dur))
+
+            scored_saavn.sort(key=lambda x: x[0], reverse=True)
+            if scored_saavn:
+                _, best_dl, cand_label, cand_dur = scored_saavn[0]
+                logger.info(
+                    f"✅ Audio de estudio oficial obtenido vía Saavn CDN (320kbps): {cand_label} ({cand_dur}s)"
+                )
+                return {
+                    "url": best_dl,
+                    "title": cand_label,
+                    "duration": cand_dur,
+                    "ext": "m4a",
+                }
+        except Exception:
+            continue
+
+    return None
+
+
 def fetch_youtube_piped_stream(video_id: str) -> Optional[Dict[str, Any]]:
     """
     Si yt-dlp llega a fallar en un video_id de YouTube, consulta instancias públicas de Piped/Invidious
@@ -764,9 +1049,10 @@ def fetch_youtube_piped_stream(video_id: str) -> Optional[Dict[str, Any]]:
 
     piped_hosts = [
         "https://pipedapi.kavin.rocks",
+        "https://pipedapi.adminforge.de",
+        "https://pipedapi.reallyaweso.me",
+        "https://pipedapi.ducks.party",
         "https://api.piped.private.coffee",
-        "https://pipedapi.tokhmi.xyz",
-        "https://pipedapi.moomoo.me",
     ]
     for host in piped_hosts:
         try:
@@ -775,7 +1061,7 @@ def fetch_youtube_piped_stream(video_id: str) -> Optional[Dict[str, Any]]:
                 url,
                 headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"},
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             audio_streams = data.get("audioStreams") or []
             best_stream = None
@@ -798,8 +1084,10 @@ def fetch_youtube_piped_stream(video_id: str) -> Optional[Dict[str, Any]]:
             continue
 
     invidious_hosts = [
+        "https://inv.perditum.com",
+        "https://invidious.privacyredirect.com",
+        "https://invidious.f5.si",
         "https://inv.nadeko.net",
-        "https://invidious.nerdvpn.de",
         "https://yewtu.be",
     ]
     for host in invidious_hosts:
@@ -809,7 +1097,7 @@ def fetch_youtube_piped_stream(video_id: str) -> Optional[Dict[str, Any]]:
                 url,
                 headers={"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0"},
             )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with urllib.request.urlopen(req, timeout=4) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
             adaptive = data.get("adaptiveFormats") or []
             for fmt in adaptive:
@@ -922,12 +1210,12 @@ def _try_direct_youtube_info(target_query: str) -> Optional[Dict[str, Any]]:
     has_cookies = bool(get_fresh_cookie_file())
     if has_cookies:
         profiles = [
+            {"use_cookies": False, "player_clients": ["android_vr", "mweb", "web_safari"]},
             {"use_cookies": True, "player_clients": ["web_creator", "web", "mweb", "web_safari"]},
-            {"use_cookies": False, "player_clients": ["mweb", "web_safari", "ios", "tv"]},
         ]
     else:
         profiles = [
-            {"use_cookies": False, "player_clients": ["mweb", "web_safari", "ios", "tv"]},
+            {"use_cookies": False, "player_clients": ["android_vr", "mweb", "web_safari"]},
         ]
     for prof in profiles:
         opts = build_ytdl_options(
@@ -955,6 +1243,52 @@ def _try_direct_youtube_info(target_query: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+def _download_url_to_file(url: str, dest_path: str) -> bool:
+    """Descarga un stream de audio directo a disco usando HTTP directo o FFmpeg y verifica su PCM."""
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp, open(dest_path, "wb") as out_f:
+            shutil.copyfileobj(resp, out_f)
+        if os.path.isfile(dest_path) and os.path.getsize(dest_path) > 16384 and verify_audio_file_pcm(dest_path):
+            return True
+    except Exception:
+        pass
+
+    try:
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-v",
+            "error",
+            "-nostdin",
+            "-reconnect",
+            "1",
+            "-reconnect_streamed",
+            "1",
+            "-i",
+            url,
+            "-vn",
+            "-c:a",
+            "copy",
+            dest_path,
+        ]
+        subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
+        if os.path.isfile(dest_path) and os.path.getsize(dest_path) > 16384 and verify_audio_file_pcm(dest_path):
+            return True
+    except Exception:
+        pass
+
+    try:
+        if os.path.isfile(dest_path):
+            os.remove(dest_path)
+    except Exception:
+        pass
+    return False
+
+
 def _resolve_soundcloud_stream(
     search_text: str,
     requester: discord.abc.User,
@@ -963,27 +1297,11 @@ def _resolve_soundcloud_stream(
     user_query: str = "",
 ) -> Track:
     """
-    Resuelve el stream de audio completo en formato MP3 (http_mp3_1_0 / hls_mp3_1_0),
-    filtrando estrictamente covers, remixes raros, slowed+reverb, hardcore y previews de 30s,
-    y verificando que la duración coincida con la canción original de YouTube.
+    Resuelve primero el audio de estudio oficial (Tidal HiFi / Monochrome / JioSaavn)
+    y solo usa SoundCloud si es un enlace explícito de SoundCloud o pista indie verificada.
     """
-    clean_query = search_text.strip()
-    for noise in (
-        "(Official Video)",
-        "(Video Oficial)",
-        "[Official Video]",
-        "(Official Music Video)",
-        "[Official Music Video]",
-        "(Official Audio)",
-        "(Audio Oficial)",
-        "(Official Lyric Video)",
-        "(Lyrics)",
-        "(Letra)",
-        "(Visualizer)",
-        " - Topic",
-    ):
-        clean_query = re.sub(re.escape(noise), "", clean_query, flags=re.IGNORECASE)
-    clean_query = clean_query.strip()
+    clean_query = _clean_music_query(search_text)
+    expected_dur = yt_meta.get("duration") if yt_meta else None
 
     if clean_query.startswith(("http://", "https://")) and "soundcloud.com" in clean_query:
         sc_single_opts = build_ytdl_options(
@@ -1005,6 +1323,30 @@ def _resolve_soundcloud_stream(
                 thumbnail=info.get("thumbnail"),
                 requester=requester,
             )
+
+    # 1. Buscar primero en catálogos oficiales de estudio (Tidal HiFi / Monochrome y JioSaavn)
+    studio = fetch_studio_master_stream(
+        clean_query,
+        user_query=user_query or clean_query,
+        expected_duration=expected_dur,
+    )
+    if studio and studio.get("url"):
+        display_title = (yt_meta.get("title") if yt_meta else None) or studio.get("title") or clean_query
+        display_webpage = (
+            (yt_meta.get("webpage_url") if yt_meta else None)
+            or (f"https://www.youtube.com/watch?v={yt_meta['video_id']}" if yt_meta and yt_meta.get("video_id") else studio["url"])
+        )
+        display_vid_id = (yt_meta.get("video_id") if yt_meta else None) or ""
+        display_thumb = (yt_meta.get("thumbnail") if yt_meta else None)
+        return Track(
+            title=display_title,
+            webpage_url=display_webpage,
+            stream_url=studio["url"],
+            video_id=display_vid_id,
+            duration=studio.get("duration") or expected_dur,
+            thumbnail=display_thumb,
+            requester=requester,
+        )
 
     flat_opts = build_ytdl_options(
         allow_playlist=False,
@@ -1029,80 +1371,82 @@ def _resolve_soundcloud_stream(
         use_cookies=False,
         for_soundcloud=True,
     )
-    expected_dur = yt_meta.get("duration") if yt_meta else None
     entries.sort(key=lambda e: _score_search_entry(e, clean_query, expected_dur), reverse=True)
+    q_words = [w for w in re.findall(r"\w+", clean_query.lower()) if len(w) > 2]
 
-    # Dos pasadas: 1) Coincidencia estricta de duración (±28s) y sin palabras prohibidas.
-    #              2) Sin palabras prohibidas ni previews (<45s).
-    for strict_pass in (True, False):
-        for entry in entries:
-            cand_url = entry.get("url") or entry.get("webpage_url")
-            cand_title = entry.get("title") or ""
-            cand_dur = entry.get("duration")
-            if not cand_url:
+    for entry in entries:
+        cand_url = entry.get("url") or entry.get("webpage_url")
+        cand_title = entry.get("title") or ""
+        cand_dur = entry.get("duration")
+        if not cand_url:
+            continue
+
+        if q_words:
+            cand_low = f"{cand_title} {entry.get('uploader') or ''}".lower()
+            if sum(1 for w in q_words if w in cand_low) < max(1, len(q_words) // 2):
                 continue
 
+        if is_unwanted_audio_variant(
+            cand_title,
+            user_query=user_query or clean_query,
+            expected_duration=expected_dur,
+            candidate_duration=cand_dur,
+            strict_duration=True,
+        ):
+            continue
+
+        try:
+            with yt_dlp.YoutubeDL(stream_opts) as ytdl:
+                track_info = ytdl.extract_info(cand_url, download=False)
+            if not track_info or not track_info.get("url"):
+                continue
+
+            full_title = track_info.get("title") or cand_title
+            duration = track_info.get("duration") or cand_dur
             if is_unwanted_audio_variant(
-                cand_title,
+                full_title,
                 user_query=user_query or clean_query,
                 expected_duration=expected_dur,
-                candidate_duration=cand_dur,
-                strict_duration=strict_pass,
+                candidate_duration=duration,
+                strict_duration=True,
             ):
                 continue
 
-            try:
-                with yt_dlp.YoutubeDL(stream_opts) as ytdl:
-                    track_info = ytdl.extract_info(cand_url, download=False)
-                if not track_info or not track_info.get("url"):
-                    continue
+            best_url = track_info["url"]
+            for fmt in track_info.get("formats") or []:
+                fmt_id = str(fmt.get("format_id") or "")
+                fmt_url = fmt.get("url")
+                if fmt_url and "http_mp3" in fmt_id:
+                    best_url = fmt_url
+                    break
 
-                full_title = track_info.get("title") or cand_title
-                duration = track_info.get("duration") or cand_dur
-                if is_unwanted_audio_variant(
-                    full_title,
-                    user_query=user_query or clean_query,
-                    expected_duration=expected_dur,
-                    candidate_duration=duration,
-                    strict_duration=strict_pass,
-                ):
-                    continue
+            sc_page = track_info.get("webpage_url") or cand_url
+            display_title = (
+                (yt_meta.get("title") if yt_meta else None)
+                or full_title
+                or clean_query
+            )
+            display_webpage = (yt_meta.get("webpage_url") if yt_meta else None) or sc_page
+            display_vid_id = (yt_meta.get("video_id") if yt_meta else None) or str(track_info.get("id", ""))
+            display_thumb = (yt_meta.get("thumbnail") if yt_meta else None) or track_info.get("thumbnail")
 
-                best_url = track_info["url"]
-                for fmt in track_info.get("formats") or []:
-                    fmt_id = str(fmt.get("format_id") or "")
-                    fmt_url = fmt.get("url")
-                    if fmt_url and "http_mp3" in fmt_id:
-                        best_url = fmt_url
-                        break
-
-                sc_page = track_info.get("webpage_url") or cand_url
-                display_title = (
-                    (yt_meta.get("title") if yt_meta else None)
-                    or full_title
-                    or clean_query
-                )
-                display_webpage = (yt_meta.get("webpage_url") if yt_meta else None) or sc_page
-                display_vid_id = (yt_meta.get("video_id") if yt_meta else None) or str(track_info.get("id", ""))
-                display_thumb = (yt_meta.get("thumbnail") if yt_meta else None) or track_info.get("thumbnail")
-
-                candidate_track = Track(
-                    title=display_title,
-                    webpage_url=display_webpage,
-                    soundcloud_url=sc_page,
-                    stream_url=best_url,
-                    video_id=display_vid_id,
-                    duration=duration or expected_dur,
-                    thumbnail=display_thumb,
-                    requester=requester,
-                )
-                logger.info(
-                    f"✅ Pista verificada seleccionada: {candidate_track.title} (fuente='{full_title}', {duration}s)"
-                )
-                return candidate_track
-            except Exception as exc:
-                logger.debug(f"Saltando candidato ({cand_url}) por error: {exc}")
-                continue
+            candidate_track = Track(
+                title=display_title,
+                webpage_url=display_webpage,
+                soundcloud_url=sc_page,
+                stream_url=best_url,
+                video_id=display_vid_id,
+                duration=duration or expected_dur,
+                thumbnail=display_thumb,
+                requester=requester,
+            )
+            logger.info(
+                f"✅ Pista verificada seleccionada: {candidate_track.title} (fuente='{full_title}', {duration}s)"
+            )
+            return candidate_track
+        except Exception as exc:
+            logger.debug(f"Saltando candidato ({cand_url}) por error: {exc}")
+            continue
 
     raise ValueError(f"No se encontró una versión original completa para '{clean_query}'.")
 
@@ -1152,11 +1496,11 @@ def download_track_to_tmp(track: Track) -> Track:
         has_cookies = bool(get_fresh_cookie_file())
         yt_profiles = (
             (
+                (False, ["android_vr", "mweb", "web_safari"]),
                 (True, ["web_creator", "web", "mweb", "web_safari"]),
-                (False, ["mweb", "web_safari", "ios", "tv"]),
             )
             if has_cookies
-            else ((False, ["mweb", "web_safari", "ios", "tv"]),)
+            else ((False, ["android_vr", "mweb", "web_safari"]),)
         )
         for use_cookies, clients in yt_profiles:
             yt_opts = build_ytdl_options(
@@ -1191,42 +1535,39 @@ def download_track_to_tmp(track: Track) -> Track:
             except Exception as exc:
                 logger.debug(f"Intento descarga YouTube (cookies={use_cookies}) falló para '{yt_target}': {exc}")
 
-        # 2. Si yt-dlp falló y tenemos el video_id de YouTube, intentar extraer el audio exacto del video vía Piped/Invidious
+        # 2. Catálogo oficial de estudio sin DRM (Tidal HiFi vía Monochrome / JioSaavn 320kbps)
+        studio_info = fetch_studio_master_stream(
+            track.title,
+            user_query=track.title,
+            expected_duration=track.duration,
+        )
+        if studio_info and studio_info.get("url"):
+            ext = studio_info.get("ext") or "m4a"
+            studio_file = os.path.join(AUDIO_CACHE_DIR, f"{uid}.{ext}")
+            if _download_url_to_file(studio_info["url"], studio_file):
+                track.local_file = studio_file
+                track.stream_url = studio_info["url"]
+                track.duration = track.duration or studio_info.get("duration")
+                logger.info(
+                    f"⚡ Audio oficial de estudio descargado en /tmp ({os.path.getsize(studio_file) // 1024} KB): {track.title}"
+                )
+                return track
+
+        # 3. Si aún no se descargó y tenemos el video_id de YouTube, intentar extraer vía Piped/Invidious
         vid_id = track.video_id if (track.video_id and len(str(track.video_id)) == 11) else extract_youtube_video_id(yt_target)
         if vid_id:
             piped_info = fetch_youtube_piped_stream(vid_id)
             if piped_info and piped_info.get("url"):
                 piped_file = os.path.join(AUDIO_CACHE_DIR, f"{uid}.m4a")
-                try:
-                    cmd = [
-                        "ffmpeg",
-                        "-y",
-                        "-v",
-                        "error",
-                        "-nostdin",
-                        "-reconnect",
-                        "1",
-                        "-reconnect_streamed",
-                        "1",
-                        "-i",
-                        piped_info["url"],
-                        "-vn",
-                        "-c:a",
-                        "copy",
-                        piped_file,
-                    ]
-                    subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25)
-                    if os.path.isfile(piped_file) and verify_audio_file_pcm(piped_file):
-                        track.local_file = piped_file
-                        track.stream_url = piped_info["url"]
-                        track.duration = track.duration or piped_info.get("duration")
-                        track.thumbnail = track.thumbnail or piped_info.get("thumbnail")
-                        logger.info(
-                            f"⚡ Audio exacto de YouTube (Piped/Invidious) descargado en /tmp ({os.path.getsize(piped_file) // 1024} KB): {track.title}"
-                        )
-                        return track
-                except Exception as exc:
-                    logger.debug(f"Descarga Piped/Invidious falló para {vid_id}: {exc}")
+                if _download_url_to_file(piped_info["url"], piped_file):
+                    track.local_file = piped_file
+                    track.stream_url = piped_info["url"]
+                    track.duration = track.duration or piped_info.get("duration")
+                    track.thumbnail = track.thumbnail or piped_info.get("thumbnail")
+                    logger.info(
+                        f"⚡ Audio exacto de YouTube (Piped/Invidious) descargado en /tmp ({os.path.getsize(piped_file) // 1024} KB): {track.title}"
+                    )
+                    return track
 
     # 3. Respaldo verificado (sin covers ni remixes) y descarga a /tmp
     if not track.soundcloud_url and not is_explicit_soundcloud:
